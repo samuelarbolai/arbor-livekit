@@ -1,0 +1,17 @@
+# Ignore all environment variable files anywhere in the tree
+**/.env
+**/.env.*
+!**/.env.example
+
+# Ignore all Python virtual environments
+**/venv/
+**/.venv/
+**/env/
+**/.env/
+
+# Ignore all Node.js package directories
+**/node_modules/
+
+# Ignore IDE specific settings (optional but recommended)
+**/.vscode/
+**/.idea/

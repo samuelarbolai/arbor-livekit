@@ -1,0 +1,6 @@
+ignoredBuiltDependencies:
+  - '@ffmpeg-installer/darwin-arm64'
+  - esbuild
+  - onnxruntime-node
+  - protobufjs
+  - sharp
