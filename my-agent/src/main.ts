@@ -36,14 +36,14 @@ export default defineAgent({
       // A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
       // See all providers at https://docs.livekit.io/agents/models/llm/
       llm: new inference.LLM({
-        model: 'openai/gpt-4.1-mini',
+        model: 'google/gemini-3-flash-preview',
       }),
 
       // Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
       // See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
       tts: new inference.TTS({
         model: 'cartesia/sonic-3',
-        voice: '9626c31c-bec5-4cca-baa8-f8ba9e84c8bc',
+        voice: 'f9836c6e-a0bd-460e-9d3c-f7299fa60f94',
       }),
 
       // VAD and turn detection are used to determine when the user is speaking and when the agent should respond
@@ -83,7 +83,7 @@ export default defineAgent({
 
     // Greet the user on joining
     session.generateReply({
-      instructions: 'Greet the user in a helpful and friendly manner.',
+      instructions: 'Greet the user and ask if they are hearing you well.',
     });
   },
 });

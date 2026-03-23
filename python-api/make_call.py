@@ -54,7 +54,7 @@ async def make_call(phone_number):
     await lkapi.aclose()
 
 async def main():
-    phone_number = "+573004011360"
+    phone_number = "+573168248411"
     await make_call(phone_number)
 
 if __name__ == "__main__":
