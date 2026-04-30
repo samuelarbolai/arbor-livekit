@@ -11,7 +11,7 @@ import {initializeApp} from "firebase-admin/app";
 import {setGlobalOptions} from "firebase-functions";
 import {onRequest} from "firebase-functions/https";
 import * as logger from "firebase-functions/logger";
-import {getFirestore, FieldValue} from "firebase-admin/firestore";
+import {getFirestore} from "firebase-admin/firestore";
 import {onSchedule} from "firebase-functions/v2/scheduler";
 
 // Start writing functions
@@ -38,7 +38,7 @@ export const helloWorld = onRequest((request, response) => {
 initializeApp();
 const db = getFirestore();
 import "dotenv/config";
-import {AgentDispatchClient, SipClient, TwirpError} from "livekit-server-sdk";
+import {AgentDispatchClient} from "livekit-server-sdk";
 
 export const makeCallsBatchFunction = onRequest(async (req, res) => {
   interface AgentConfig {
@@ -54,20 +54,13 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
   const LIVEKIT_URL = process.env.LIVEKIT_URL!;
   const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY!;
   const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET!;
-  const SIP_OUTBOUND_TRUNK_ID = process.env.SIP_OUTBOUND_TRUNK_ID!;
 
-  const sipClient = new SipClient(
-    LIVEKIT_URL,
-    LIVEKIT_API_KEY,
-    LIVEKIT_API_SECRET
-  );
   const agentDispatchClient = new AgentDispatchClient(
     LIVEKIT_URL,
     LIVEKIT_API_KEY,
     LIVEKIT_API_SECRET
   );
 
-  const trunkId = SIP_OUTBOUND_TRUNK_ID;
   const agentName = "my-agent";
 
   /**
@@ -82,7 +75,6 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
     voiceId = "03496517-369a-4db1-8236-3d3ae459ddf7",
     phoneNumber,
   }: AgentConfig): Promise<void> {
-    if (!trunkId) throw new Error("Missing SIP_OUTBOUND_TRUNK_ID");
     if (!phoneNumber) throw new Error("Missing phone number");
     if (!userID) throw new Error("Missing user ID");
 
@@ -90,18 +82,12 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
      `room-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     const metadataContents = {
-      userId: userID,
+      user_id: userID,
       phone_number: phoneNumber,
       user_input: userInput,
       language: language,
       voice_id: voiceId,
-    };
-
-    const sipParticipantOptions = {
-      participantIdentity: phoneNumber,
-      participantName: `Test Caller: ${phoneNumber}`,
-      krispEnabled: true,
-      waitUntilAnswered: true,
+      room_name: roomName,
     };
 
     const dispatch = await agentDispatchClient.createDispatch(
@@ -112,37 +98,6 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
       }
     );
     console.log("created dispatch", dispatch);
-
-    try {
-      const participant = await sipClient.createSipParticipant(
-        trunkId,
-        phoneNumber,
-        roomName,
-        sipParticipantOptions
-      );
-      console.log("Participant created:", participant);
-    } catch (error) {
-      console.error("Error creating SIP participant:", error);
-      if (error instanceof TwirpError) {
-        const sipCode = error.metadata?.["sip_status_code"] || "Unknown";
-        console.error("SIP error code: ", sipCode);
-        console.error("SIP error message: ", error.metadata?.["sip_status"]);
-        const fallbackTriggers = [
-          "486", // "Busy Here"
-          "603", // "Decline"
-          "408", // "Request Timeout"
-          "480", // "Temporarily Unavailable"
-        ];
-        if (fallbackTriggers.includes(sipCode)) {
-          const docref = db.doc("D6BkPWFjMbTfCotrnOUj");
-          await docref.update({
-            usersIDs: FieldValue.arrayUnion(userID),
-          });
-          console.log(`Added user ${userID} 
-            to fallback list due to SIP error ${sipCode}`);
-        }
-      }
-    }
   }
 
   /**
@@ -285,6 +240,12 @@ export const checkUsersRituals = onSchedule({
   const db = getFirestore();
 
   const now = new Date();
+
+  // Round down to nearest 30-minute mark
+  const roundedMinutes = now.getMinutes() >= 30 ? 30 : 0;
+  const roundedNow = new Date(now);
+  roundedNow.setMinutes(roundedMinutes, 0, 0); // zero out seconds/ms
+
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Bogota",
     hour: "2-digit",
@@ -292,7 +253,7 @@ export const checkUsersRituals = onSchedule({
     hour12: false,
   });
 
-  const cleanTime = formatter.format(now);
+  const cleanTime = formatter.format(roundedNow);
 
   const dayName = new Intl
     .DateTimeFormat("en-US", {weekday: "short", timeZone: "America/Bogota"})
@@ -305,46 +266,80 @@ export const checkUsersRituals = onSchedule({
   const ritualsRef = db.collection("rituals");
 
   const snapshotForCount = await ritualsRef.count().get();
+
   const totalCount = snapshotForCount.data().count;
   logger.info(`Found ${totalCount} rituals in DB`);
 
   const scheduleKey = `${dayName.toUpperCase()}_${cleanTime}`;
   logger.log("Schedule key:", scheduleKey);
 
-  const snapshot = await ritualsRef
+  const schedulesSnapshot = await ritualsRef
     .where("schedules", "array-contains", scheduleKey)
     .get();
 
-  logger.info(`Found ${snapshot.size} rituals in the next 15 mins`);
+  const fallbackSnapshot = await ritualsRef
+    .where("fallbackSchedules", "array-contains", scheduleKey)
+    .where("fallback_active", "==", true)
+    .get();
 
-  if (snapshot.empty) {
-    logger.info("No rituals found in this window.");
-  }
+  logger.info(`Found ${schedulesSnapshot.size} 
+    scheduled rituals in the next 15 mins`);
 
-  const userIds = snapshot.docs.map((doc) => doc.data().userID);
+  logger.info(`Found ${fallbackSnapshot.size} 
+    fallback rituals in the next 15 mins`);
 
-  logger.info("Rituals to trigger:", userIds);
+  const scheduledUserIds = schedulesSnapshot.docs.map((doc) =>
+    doc.data().userID);
 
-  logger.info(`Found ${userIds.length}
-    rituals. Passing to LiveKit Dispatcher`);
+  const fallbackUserIds = fallbackSnapshot.docs.map((doc) =>
+    doc.data().userID);
+
+  logger.info("Scheduled rituals to trigger:", scheduledUserIds);
+
+  logger.info(`Found ${scheduledUserIds.length}
+    scheduled rituals. Passing to LiveKit Dispatcher`);
 
   try {
-    if (userIds.length > 0) {
+    if (scheduledUserIds.length > 0) {
       const response = await fetch(
         "https://makecallsbatchfunction-b6fhjlgejq-uc.a.run.app",
         {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify(userIds),
+          body: JSON.stringify(scheduledUserIds),
         }
       );
       const result = await response.text();
-      console.log(result);
+      logger.info(result);
     } else {
       const response = "No rituals to trigger, skipping call to dispatcher.";
-      console.log(response);
+      logger.info(response);
     }
   } catch (error) {
-    logger.error("Failed to hand off rituals to ADK function:", error);
+    logger.error("Failed to hand off scheduled rituals to dispatcher:", error);
+  }
+
+  try {
+    if (fallbackUserIds.length > 0) {
+      const response = await fetch(
+        "https://makecallsbatchfunction-b6fhjlgejq-uc.a.run.app",
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(fallbackUserIds),
+        }
+      );
+      const result = await response.text();
+      logger.info(result);
+    } else {
+      const response =
+        "No fallback rituals to trigger, skipping call to dispatcher.";
+      logger.info(response);
+    }
+  } catch (error) {
+    logger.error(
+      "Failed to hand off fallback rituals to dispatcher:",
+      error
+    );
   }
 });

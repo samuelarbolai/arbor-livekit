@@ -1,10 +1,12 @@
 import { voice, llm } from '@livekit/agents';
-import { type JobContext } from '@livekit/agents';
+import { RoomServiceClient } from 'livekit-server-sdk';
+import { type JobContext, getJobContext } from '@livekit/agents';
 import {getFirestore, FieldValue} from "firebase-admin/firestore";
 import { z } from 'zod';
 
 // Define a custom voice AI assistant by extending the base Agent class
 export class Agent extends voice.Agent {
+
   constructor(chatCtx: llm.ChatContext, jobCtx: JobContext) {
     super({
       chatCtx,
@@ -93,21 +95,30 @@ export class Agent extends voice.Agent {
       // },
       tools: {
             leaveVoicemail: llm.tool({
-                description: 'Call this tool if you detect a voicemail system, AFTER you hear the voicemail greeting',
+                description: 'Call this tool whenever you detect a voicemail or an unresponsive caller in the first interaction. Add the user ID to a fallback list in Firestore for later follow-up.',
                 parameters: z.object({
                   userID: z
                       .string()
                       .describe('The user ID to add to the voicemail list in Firestore'),
                 }),
-                execute: async ({ userID }, { ctx }) => {
-                  jobCtx.shutdown();
+                execute: async ({ userID }) => {
                   console.log('Detected voicemail greeting, shutting down the agent.')
                   const db = getFirestore();
                   const docref = db.doc("D6BkPWFjMbTfCotrnOUj");
-                  await docref.update(docref, {
+                  await docref.update({
                     usersIDs: FieldValue.arrayUnion(userID),
                   });
                   console.log(`Added user ${userID} to the fallback list in Firestore.`);
+
+                  const jobContext = getJobContext();
+                  if (!jobContext) return;
+                  const roomServiceClient = new RoomServiceClient(
+                    process.env.LIVEKIT_URL!,
+                    process.env.LIVEKIT_API_KEY!,
+                    process.env.LIVEKIT_API_SECRET!,
+                  );
+
+                  await roomServiceClient.deleteRoom(jobContext.room.name!);
                 },
             }),  
           },

@@ -42,8 +42,10 @@
     "@livekit/agents-plugin-openai": "~1.2.1",
     "@livekit/agents-plugin-silero": "^1.0.46",
     "@livekit/noise-cancellation-node": "^0.1.9",
+    "@livekit/rtc-node": "^0.13.25",
     "dotenv": "^17.3.1",
     "firebase-admin": "^13.8.0",
+    "livekit-server-sdk": "^2.15.1",
     "zod": "^3.25.76"
   }
 }
