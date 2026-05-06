@@ -4,6 +4,7 @@
     "esModuleInterop": true,
     "moduleResolution": "nodenext",
     "noImplicitReturns": true,
+    "skipLibCheck": true,
     "noUnusedLocals": true,
     "outDir": "lib",
     "sourceMap": true,
