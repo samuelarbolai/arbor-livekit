@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@mastra/core": "^1.32.1",
     "@upstash/qstash": "^2.10.1",
     "@upstash/workflow": "^1.2.0",
     "firebase-admin": "^13.8.0",

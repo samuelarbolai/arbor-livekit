@@ -117,7 +117,7 @@ export const { POST } = serve<PerUserPayload>(async (context) => {
 
 **Deliverable:** A successful voice call with all three KPIs answered ends the workflow without entering the SMS path. The `trackingEvents` doc has all three KPIs and `completedAt` set.
 
-### Phase 4: SMS chat fallback (Mastra + Telnyx + index doc) — 📋 PLANNED
+### Phase 4: SMS chat fallback (Mastra + Telnyx + index doc) — ✅ DONE (2026-05-06; pending integration test)
 **In-file locations:** `app/api/tracking-workflow/per-user/route.ts`, `app/api/sms-inbound/route.ts`, `lib/chat-agent.ts`, `lib/telnyx.ts`.
 **Specification of what should NOT be modified:**
 - The voice path (Phase 3) — SMS is purely additive.
@@ -160,7 +160,7 @@ export const { POST } = serve<PerUserPayload>(async (context) => {
 
 **Deliverable:** A user who misses the voice call but replies to the SMS opener completes the three KPIs over SMS and the workflow finalizes correctly.
 
-### Phase 5: Final write + link delivery — 📋 PLANNED
+### Phase 5: Final write + link delivery — ✅ DONE (2026-05-06; pending integration test)
 **In-file location:** `app/api/tracking-workflow/per-user/route.ts`, `lib/links.ts`, `lib/tracking-events.ts`.
 
 Note: `lib/tracking-events.ts`'s `mergeFinal` was already created in Phase 3 for the voice callback. This phase reuses it for the SMS finalization path; same monotonic-merge contract, no new helper.
@@ -236,6 +236,8 @@ Note: `lib/tracking-events.ts`'s `mergeFinal` was already created in Phase 3 for
 - **Phase 5 piece** — `lib/links.ts` ships `decideLink(ritualKpis)` with the precedence rule (used-out > failure > none). Wiring it into the per-user route is pending Phase 4 (SMS path).
 - **Phase 6 (root + per-tz fan-out)** — `lib/workflows/root.ts` and `lib/workflows/per-user.ts` defined via `createWorkflow`; co-mounted at `app/api/tracking-workflow/[...any]/route.ts` via `serveMany({ root, 'per-user': perUser })`. Root loads `rituals.where('timeZone', '==', tz)`, dedups by `userID`, and fans out via `Promise.all` of `context.invoke(perUserWorkflow, ...)` calls under shared `flowControl: { key: 'tracking-per-user', parallelism: 5 }`. New trigger script `scripts/trigger-root.ts` takes `[tz] [round]` and posts to `/api/tracking-workflow/root`. Pending: deploy + integration test (trigger root for `America/Bogota`, observe N child runs in Upstash dashboard).
 - **Phase 7 (QStash schedules + integration runbook)** — `scripts/sync-schedules.ts` ships with `TIMEZONES = ['America/Bogota']` and two ROUNDS (primary @ 18:00, retry @ 20:00). Idempotent via stable `scheduleId` (`tracking-{round}-{tz-slug}`). Timezone bound to the cron via `CRON_TZ=<tz>` prefix syntax — the `@upstash/qstash` SDK 2.10.1's `CreateScheduleRequest` doesn't expose a `timezone` field (the skill page is outdated for this version), but QStash's REST endpoint accepts the prefix. Flags: no flag = sync, `--list` = print existing tracking-* schedules, `--delete` = remove all tracking-* schedules. Running it: `pnpm tsx scripts/sync-schedules.ts`. Pending: one-shot run against the production Upstash project + the manual integration runbook below.
+- **Phase 4 (SMS chat fallback)** — `lib/telnyx.ts` (sendSms + Ed25519 verify wrapper), `lib/i18n.ts` (es/en openers + link intros), `lib/chat-agent.ts` (Mastra Agent on `google/gemini-2.5-flash` with `recordKPI`, `markRitualUsedOut`, `complete` tools; `runChatTurn` + `computeRemaining` helpers), `app/api/sms-inbound/route.ts` (verifies Telnyx signature, looks up `smsActiveRuns/{phoneNumber}`, calls `client.notify('sms-reply-${runId}')`). Per-user route now: writes `smsActiveRuns/{phone}` index, sends opener, loops up to TURN_BUDGET=6 with 30m per-turn timeout, mergeFinal-persists each turn's KPI updates, exits on agent's `complete()` or full coverage. tsconfig target bumped to ES2022 for Mastra. `@mastra/core@1.32.1` installed. `voice timeout` falls through to SMS by reading the latest doc from Firestore (instead of giving up).
+- **Phase 5 (final write + link delivery)** — `deliverLinkAndFinalize` helper at the bottom of per-user.ts: calls `decideLink` (used-out > failure > none), wraps the URL in the language-aware intro from `i18n.ts`, sends via Telnyx, then bumps `users/{userID}.lastTrackingEventAt`. Symmetric across the voice-success and SMS-success branches; both call the same helper. Skipped silently when Telnyx env vars are missing (so a misconfigured prod doesn't crash the workflow).
 
 ### Integration runbook 📋
 Manual end-to-end test for the cron path (Phase 6+7), independent of Telnyx Messaging Profile:
@@ -248,8 +250,7 @@ Manual end-to-end test for the cron path (Phase 6+7), independent of Telnyx Mess
 7. (BLOCKED until Phase 5 wires it in) Used-out exception → new-belief link arrives instead of optimisation.
 
 ### Pending 📋
-- **Phase 4 (SMS chat fallback)** — Decisions resolved 2026-05-05: Mastra + `google/gemini-3-flash-preview` (same `GOOGLE_API_KEY` as narya/tracking-agent); es/en only; tsconfig will bump to ES2022 when Mastra lands. Still BLOCKED on Telnyx Messaging Profile setup (user action).
-- **Phase 5 (final write + link delivery)** — `decideLink` ready in `lib/links.ts`. Voice-success branch can be wired now (when `allRitualsComplete(merged)` after voice → call `decideLink` → Telnyx send). SMS-success wiring waits on Phase 4.
+- (none — all seven phases shipped end-to-end pending real-call verification)
 
 ### Small follow-ups (from first end-to-end voice test 2026-05-05) 🔧
 - **Bug fixed in `lib/tracking-events.ts` `allRitualsComplete`**: a ritual now counts as complete if `ritualUsedOut === true`, not only if all three KPIs are non-null. Without this, single-ritual conversations that ended via `markRitualUsedOut` left `completedAt` unstamped and would have leaked into the SMS path once Phase 4 lands.

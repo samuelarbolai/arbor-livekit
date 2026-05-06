@@ -25,11 +25,20 @@ dotenv.config({ path: '.env.local' });
 
 type Language = 'en' | 'es';
 
+// Hardcoded Cartesia voiceIDs per language (2026-05-06 user choice). The
+// tracking-agent intentionally ignores `metadata.voice_id` — voice for
+// tracking calls is a brand decision, not a per-user preference. Narya
+// (the morning-coaching agent) still consumes the user's voiceID; the
+// two agents have different roles and intentionally use different voices.
+const VOICE_ID_BY_LANGUAGE: Record<Language, string> = {
+  en: '5ee9feff-1265-424a-9d7f-8e4d431a12c7', // English-Male
+  es: 'b042270c-d46f-4d4f-8fb0-7dd7c5fe5615', // Spanish-Male
+};
+
 interface DispatchMetadata {
   user_id: string;
   phone_number: string;
   language: string;
-  voice_id: string;
   room_name: string;
   run_id: string;
   tracking_callback_url: string;
@@ -58,7 +67,7 @@ export default defineAgent<ProcessUserData>({
     // Cast to Language for the deepgram/cartesia plugins which accept a
     // narrow union. Defaults to 'en' if metadata didn't include one.
     const language = ((metadata.language as Language) ?? 'en') as Language;
-    const voiceId = metadata.voice_id ?? '03496517-369a-4db1-8236-3d3ae459ddf7';
+    const voiceId = VOICE_ID_BY_LANGUAGE[language];
     const roomName = metadata.room_name ?? ctx.room.name ?? '';
     const runId = metadata.run_id ?? '';
     const trackingCallbackUrl = metadata.tracking_callback_url;
@@ -142,7 +151,9 @@ export default defineAgent<ProcessUserData>({
         language,
       }),
       llm: new google.LLM({
-        model: 'gemini-3-flash-preview',
+        // Pinned to gemini-2.5-flash; see AGENT_MODEL comment in agent.ts
+        // for why the 3-preview model is unsafe with the current plugin.
+        model: 'gemini-2.5-flash',
       }),
       tts: new cartesia.TTS({
         model: 'sonic-3',

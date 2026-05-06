@@ -522,6 +522,15 @@ export const registerNewRitual = onRequest((req, res) => {
       googleDocId: string;
       googleDocsLink: string;
       label: string;
+      // Short, conversational name for the underlying behaviour
+      // (e.g. "morning meditation", "drinking less"). Produced by the
+      // synthesis prompt — Gemini reads the user's raw inputs and
+      // distills a 1-3 word handle the tracking agent will say aloud.
+      // Persisted on the ritual doc and mirrored into
+      // users/{userID}.behaviorLabels[googleDocId]. Falls back to the
+      // Google Doc title if Gemini's response omits it (so older
+      // prompt versions keep working).
+      behaviorLabel: string;
     }
 
     // Mirror user-level fields from the ritual into a top-level
@@ -547,6 +556,7 @@ export const registerNewRitual = onRequest((req, res) => {
           voiceID: r.agentConfig.voiceID,
           timeZone: r.timeZone,
           ritualLabels: {[r.googleDocId]: r.label},
+          behaviorLabels: {[r.googleDocId]: r.behaviorLabel},
           updatedAt: FieldValue.serverTimestamp(),
         },
         {merge: true}
@@ -687,6 +697,12 @@ export const registerNewRitual = onRequest((req, res) => {
         userInputs: string;
         schedules: string[];
         fallbackSchedules: string[];
+        // Short, conversational name for the underlying behaviour
+        // (1-3 words, e.g. "drinking less", "morning meditation").
+        // Optional only because the synthesis-prompt update may lag
+        // this code change; once the prompt is updated it will always
+        // be present. Falls back to the Google Doc title.
+        behaviorLabel?: string;
       }
       let synthesis: SynthesisResult;
       try {
@@ -718,6 +734,11 @@ export const registerNewRitual = onRequest((req, res) => {
         googleDocId: documentId,
         googleDocsLink: googleDocLink,
         label: ritualLabel,
+        // Fall back to the Google Doc title if Gemini's synthesis
+        // response doesn't yet include behaviorLabel — keeps
+        // registration working while the synthesis prompt is being
+        // updated to produce the new field.
+        behaviorLabel: synthesis.behaviorLabel ?? ritualLabel,
       };
 
       const ritualsRef = db.collection("rituals");
