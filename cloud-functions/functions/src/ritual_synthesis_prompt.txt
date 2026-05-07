@@ -65,12 +65,13 @@ RULE 8 — VOICE
 Write tag contents from the user's first-person perspective when the content is theirs (intentions, commitments, affirmations). Write descriptively in third person when the content is meta-information about them (Context, Goal, Partner). When in doubt, match the voice modeled in the tag-semantics list above.
 
 RULE 9 — OUTPUT FORMAT
-Return a SINGLE JSON object with exactly these three fields, and nothing outside the JSON object — no preamble, no code fence, no trailing prose:
+Return a SINGLE JSON object with exactly these four fields, and nothing outside the JSON object — no preamble, no code fence, no trailing prose:
 
 {
   "userInputs": "<the completely filled <user-inputs> XML block as a single string. If Rule 6's UNMAPPED MATERIAL section applies, include a blank line after the closing </user-inputs> tag and append the entire UNMAPPED MATERIAL: section as plain prose inside this same string. Do NOT emit a separate field for UNMAPPED MATERIAL — it lives inside this string.>",
   "schedules": ["<DAY_HH:MM string>", "..."],
-  "fallbackSchedules": ["<DAY_HH:MM string>", "..."]
+  "fallbackSchedules": ["<DAY_HH:MM string>", "..."],
+  "behaviorLabel": "<short conversational name per Rule 11>"
 }
 
 The worked example below shows a complete input → JSON-envelope output transformation. Match its shape exactly.
@@ -88,6 +89,23 @@ Examples:
 - "Every night at 9 PM" → schedules: ["SUN_21:00", "MON_21:00", "TUE_21:00", "WED_21:00", "THU_21:00", "FRI_21:00", "SAT_21:00"]
 - "Weekdays at 7:30 AM" → schedules: ["MON_07:30", "TUE_07:30", "WED_07:30", "THU_07:30", "FRI_07:30"]
 - "Saturdays at 10 AM, fallback Sundays at 10 AM" → schedules: ["SAT_10:00"], fallbackSchedules: ["SUN_10:00"]
+
+RULE 11 — BEHAVIOR LABEL
+Produce a `behaviorLabel`: a short, conversational handle for the BEHAVIOUR the user is tracking — the underlying problem they are trying to control or the practice they are trying to develop. This is NOT the ritual itself (the ritual is the work; the behaviour is what the work is for). It will be slotted into a daily voice/SMS check-in as: "How did you do today with <behaviorLabel>?" / "¿Cómo te fue hoy con <behaviorLabel>?". Constraints:
+
+- 1 to 3 words. Anything longer sounds awkward read aloud.
+- Same language as the call (Rule 1). Translate if needed.
+- Must read grammatically inside the sentence frames above. Test by reading it aloud.
+- PRESERVE the user's detachment metaphor (Rule 2). If the user calls their problem "my disease", use "your disease" — do NOT substitute "addiction", "depression", "anxiety", or any clinical term. The label is voiced by an agent talking TO the user, so flip first-person possessives ("my") to second-person ("your").
+- For positive-development rituals where the user is BUILDING a habit (e.g. meditation, journaling) rather than fighting one, name the habit itself — "morning meditation", "daily journaling", "evening prayer".
+- For avoidance/control rituals where the user is FIGHTING a behaviour or pattern, name it using their own framing — "screen consumption", "your disease", "the bleeding", "the noise". When the user has both a metaphor and a concrete name, prefer the metaphor (per Rule 2).
+- If the raw material is too vague to derive a clean label, default to a short generic that fits the ritual's intent (e.g. "your practice", "your habit") — never invent specifics not present in the input.
+
+Examples:
+- Thomas's input ("my disease", screen consumption) → "your disease"
+- Daily meditation user → "morning meditation"
+- "Quiero dejar de tomar" with no metaphor → "el alcohol" (call in Spanish) or "drinking" (call in English)
+- "Quiero hacer ejercicio diariamente" → "tu ejercicio diario"
 
 ============================================================
 WORKED EXAMPLE
@@ -175,14 +193,17 @@ Mi mamá será una persona que me puede ayudar a mantener mi ritual. La escojo a
     "FRI_13:00",
     "SAT_13:00"
   ],
-  "fallbackSchedules": []
+  "fallbackSchedules": [],
+  "behaviorLabel": "your disease"
 }
+
+Note on the chosen `behaviorLabel`: Thomas refers to his core problem as "my disease" throughout the raw material. Per Rule 2 we preserve that metaphor; per Rule 11 we flip "my" → "your" because the label is voiced by an agent talking TO Thomas in the daily check-in ("How did you do today with your disease?"). We do NOT use "screen consumption" — although it appears in the raw material as the concrete bleeding, Thomas's framing of the underlying problem is "the disease," and Rule 2 says metaphor wins over concrete substitution. We do NOT use "addiction", "compulsion", or any clinical term — those would violate Rule 2.
 
 ============================================================
 END OF EXAMPLE — NOW PROCESS THE ACTUAL RAW MATERIAL BELOW
 ============================================================
 
-FINAL REMINDER: Before producing your output, verify that you have NOT replaced the user's detachment metaphor (e.g., "my disease", "the bleeding", "the noise") with any clinical or specific term such as "depression", "anxiety", "addiction", "ADHD", "trauma", or similar. The user's exact metaphor must remain intact throughout the filled template — see Rule 2.
+FINAL REMINDER: Before producing your output, verify that you have NOT replaced the user's detachment metaphor (e.g., "my disease", "the bleeding", "the noise") with any clinical or specific term such as "depression", "anxiety", "addiction", "ADHD", "trauma", or similar. The user's exact metaphor must remain intact throughout the filled template AND inside the `behaviorLabel` field — see Rule 2 and Rule 11. If the user wrote "my disease," `behaviorLabel` is "your disease," NOT "depression" or "addiction."
 
 RAW MATERIAL TO PROCESS:
 [INSERT RAW USER INPUT HERE]

@@ -66,30 +66,35 @@ Built by `tracking-workflow`'s per-user route inside the `dispatch-tracking-call
 {
   user_id: string,
   phone_number: string,
-  language: string,                  // raw language name (e.g. "English", "Español") — written into instructions
-  voice_id: string,
+  language: string,                  // 'en' | 'es' — typed narrowly in main.ts; localizes prompt + STT/TTS
   room_name: string,
   run_id: string,                    // Upstash Workflow run ID (context.workflowRunId); echoed in callback
   tracking_callback_url: string,     // absolute URL of tracking-workflow's /api/tracking-callback
   rituals: Array<{                   // Per-ritual list. Walked through in order during the conversation.
     googleDocId: string,             //   Stable identifier; agent passes it back in tool calls and the shutdown POST.
-    label: string,                   //   Human-readable label (Google Doc title) — agent uses it to refer to the ritual conversationally.
+    label: string,                   //   Verbatim Google Doc title — kept for traceability/logs.
+    behaviorLabel?: string,          //   Short conversational name (e.g. "morning meditation"). Agent says THIS aloud, not `label`. Falls back to `label` when missing.
   }>,
 }
 ```
 
+`voice_id` is intentionally NOT in the metadata. The tracking-agent hardcodes its voice by language (English-Male / Spanish-Male Cartesia voiceIDs) — voice for tracking calls is a brand decision, not a per-user preference. Narya (the morning-coaching agent) still consumes `users/{userID}.voiceID`; the two agents have different roles and intentionally use different voices.
+
 Why `tracking_callback_url` is in the metadata rather than an env var: avoids hardcoding the workflow's URL into the agent's image, which means rotating the workflow deploy (or running per-PR Vercel previews) doesn't require redeploying the LiveKit agent.
 
-Why `rituals` is a list (not a single ritual): a user may own multiple active rituals. The agent walks through each one in turn, asking the same three KPIs per ritual. The `label` is the Google Doc title (sourced upstream by `cloud-functions/registerNewRitual` — see Phase 6 there) and is what the user recognizes; the agent must refer to rituals by label, not by `googleDocId`. The list is built from `users/{userID}.ritualLabels` by `tracking-workflow`, so the `users` doc is the single upstream source of truth.
+Why `rituals` is a list (not a single ritual): a user may own multiple active rituals. The agent walks through each one in turn, gathering three KPIs per ritual. `behaviorLabel` is what the user actually recognizes ("morning meditation"); the verbatim Google Doc title was previously used here and sounded awkward read aloud. `cloud-functions/registerNewRitual` populates `users/{userID}.behaviorLabels` from Gemini's synthesis output; tracking-workflow's per-user route reads it and includes it on each rituals entry.
 
 ## Conversation Goals (for the system prompt)
-The instructions string (drafted in `current-plan.md` Phase 6) must:
-- Greet briefly, in the user's language, and identify itself as a short check-in (NOT a coaching session — this is the most likely point of confusion with `my-agent`).
-- Walk through the user's rituals in dispatch order. For each ritual referred to by its `label`, ask the three KPIs in this fixed order: (1) ritual fulfillment, (2) relapse, (3) whether they answered the morning call for that ritual. The order is intentional — fulfillment is the easiest to answer and warms up the conversation; relapse is the most sensitive; "did you answer the call" is meta and least intrusive last.
-- The agent must always refer to rituals by their `label` (Google Doc title), never by `googleDocId`. The user knows their ritual by the title their therapist named it.
-- Tool calls always include the `googleDocId` of the ritual being asked about, so the entry-scope state can record per-ritual answers.
-- Listen for the "I solved it" exception per ritual ("I don't need this one anymore", "this ritual isn't a problem for me anymore", language equivalents). When detected for a ritual, call `markRitualUsedOut({ googleDocId })` and move on to the next ritual; do NOT terminate the entire call (other rituals may still need answering).
-- Cap each KPI question at ~3 turns. Do not re-ask if the user gave an unambiguous answer.
+Updated 2026-05-06: shifted from "ask three sequential questions per ritual" to a broad-opener-with-extraction shape that's faster on average. The instructions string in `agent.ts` enforces:
+- Greet briefly, identify as a tracking check-in from Samwise (NOT a coaching session — this is the most likely point of confusion with `narya-agent`).
+- Walk through the user's rituals in dispatch order. For each ritual:
+  1) **Broad opener** — first ritual: "Hi, this is the tracking agent from Samwise. How did you do today with <behaviorLabel>?" Subsequent: "And how about <behaviorLabel>?" Localized into the metadata language.
+  2) **Extract-and-fill** — listen to the reply, then fire EVERY tool that's clearly inferable from a single user turn. The user may answer one, two, or all three KPIs at once; capture them all in the same turn.
+  3) **Follow up only on gaps** — if any KPI is still missing for the current ritual after the broad opener, ask one short follow-up that covers only the gap(s). Don't re-ask anything already recorded. Cap at ~2 follow-ups per ritual.
+  4) **Move on** as soon as the current ritual has all three KPIs OR `markRitualUsedOut` fires.
+- Refer to rituals by `behaviorLabel` (the conversational name, e.g. "morning meditation"). NEVER say `label` (the verbatim Google Doc title) verbatim — it sounds awkward — and NEVER say `googleDocId`. Tool calls always include `googleDocId` so per-ritual state stays disambiguated.
+- Used-out exception: if the user reports they have outgrown a SPECIFIC ritual ("I don't need this one anymore", language equivalents), call `markRitualUsedOut({ googleDocId })` for THAT ritual. Then: if any other ritual still needs KPIs, transition to it; otherwise (this was the only ritual or every other one is already complete/used-out), end the call IMMEDIATELY with a short goodbye — do NOT walk back through KPIs you already skipped.
+- EVERY tool call must be paired with at least a brief spoken phrase in the same turn. Empty/punctuation-only TTS payloads cause Cartesia to log "Invalid transcript" errors — cosmetic but pollutes logs.
 - End the call as soon as every ritual has all three KPIs recorded OR is marked `ritualUsedOut`.
 
 ## Tool Contract
@@ -138,8 +143,12 @@ The shutdown callback runs whether the call ended naturally, hung up, hit voicem
 
 ## Environment Variables
 - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` — LiveKit Cloud credentials.
-- `SIP_OUTBOUND_TRUNK_ID` — Telnyx outbound trunk; same value as `my-agent`.
-- LLM/voice provider keys per LiveKit Inference, same setup as `my-agent`.
+- `SIP_OUTBOUND_TRUNK_ID` — Telnyx outbound trunk (`ST_ZP2XarSMKEHh`). NOT the legacy Twilio trunk; see `samwise-livekit-agents` skill for the full trunk-routing trap.
+- `DEEPGRAM_API_KEY` — STT (`nova-3`).
+- `GOOGLE_API_KEY` — Gemini LLM. Pinned to `gemini-2.5-flash`, NOT 3-preview — see `agent.ts`'s `AGENT_MODEL` comment for why (thought_signature requirement breaks the plugin).
+- `CARTESIA_API_KEY` — TTS (`sonic-3`). Voice IDs are hardcoded in `main.ts` by language (English-Male / Spanish-Male).
+
+Voice provider stack is **direct plugins**, NOT LiveKit Inference. See `samwise-livekit-agents` skill for the full provider table and rationale (predates Inference; team standardized on direct plugins; mixing the two leads to subtle tool-calling drift).
 
 No Firebase credentials needed in this module — Firestore writes happen in `tracking-workflow/api/tracking-callback`. Keep the agent stateless w.r.t. our DB.
 

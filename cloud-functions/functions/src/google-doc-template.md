@@ -27,7 +27,7 @@ For timing, write in plain language ("every night at 9 PM", "weekdays at 7:30 AM
 
 ---
 
-## 2. Coach Call
+## 2. Ritual Call
 
 User input for the ritual steps lives here — **the stop**, **the consciousness**, **the intention**, **the commitment**, **symbolic help**, **social help**, plus any prayers, mantras, or meditation questions the user wants recited.
 
@@ -101,7 +101,7 @@ The parser only looks for these five exact keys; anything else in this tab is ig
 | `schedules` | `SUN MON TUE WED THU FRI SAT` | 24-hour, on `:00` or `:30` boundary | Array of separate strings, e.g. `["MON_21:00", "TUE_21:00"]` |
 | `fallbackSchedules` | same | same | same; only fires when `fallbackActive` is `true` (default `false`) |
 
-Examples of how plain-language timing in the Coach Call tab gets converted:
+Examples of how plain-language timing in the Ritual Call tab gets converted:
 
 - "Every night at 9 PM" → `["SUN_21:00", "MON_21:00", "TUE_21:00", "WED_21:00", "THU_21:00", "FRI_21:00", "SAT_21:00"]`
 - "Weekdays at 7:30 AM" → `["MON_07:30", "TUE_07:30", "WED_07:30", "THU_07:30", "FRI_07:30"]`

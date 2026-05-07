@@ -221,6 +221,6 @@ export default defineAgent({
 cli.runApp(
   new ServerOptions({
     agent: fileURLToPath(import.meta.url),
-    agentName: 'narya-agent',
+    agentName: 'ritual-agent',
   }),
 );

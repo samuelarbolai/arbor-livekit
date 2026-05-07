@@ -165,30 +165,45 @@ export function mergeFinal(
 
 The `ritualLabels` map (`{ [googleDocId]: string }`) is the source of truth for the per-ritual list passed to `tracking-agent` in dispatch metadata as `rituals`. The agent uses these labels conversationally so the user recognizes which ritual is being asked about.
 
-Trust assumption: `users/{userID}` always exists by the time this module touches a user, because tracking is gated by ritual ownership and ritual registration is what creates the user doc. If a `users` doc is missing for a userID returned by the timezone fan-out, treat it as a hard error and skip the run (don't silently fabricate a doc — the data is wrong upstream).
+Trust assumption: `users/{userID}` always exists by the time this module touches a user, because tracking is gated by ritual ownership and ritual registration is what creates the user doc. If a `users` doc is missing for a userID returned by the timezone fan-out, the per-user route soft-skips: it logs a warning and exits cleanly. The first version threw a hard error and accumulated 3× Upstash retries per stale `rituals` row, which was noisy in the dashboard whenever seed/test data lacked a matching `users` doc. Don't fabricate a missing doc upstream either — fix the seed data.
+
+The per-user route also reads the optional `behaviorLabels: { [googleDocId]: string }` map from the same doc. This is the short, conversational name (e.g. `"morning meditation"`) used by both the voice agent and the SMS chat agent in their user-facing speech. Falls back to the verbatim `ritualLabels[googleDocId]` (the Google Doc title) when missing — populated by `cloud-functions/registerNewRitual` from Gemini's synthesis output as of 2026-05-06.
 
 ### Workflow-internal index (small Firestore helper doc)
-`smsActiveRuns/{phoneNumber}` → `{ runId, eventIdToNotify, expiresAt }`. Written when the workflow enters the SMS chat phase, deleted when the chat ends or expires. The inbound webhook uses this to map phone → run. Cheap; expected size is the count of users currently in the SMS chat phase, which is bounded by daily active users in the worst case.
+`smsActiveRuns/{phoneNumber}` → `{ runId, userID, eventDocId, startedAt, expiresAt }`. Written when the workflow enters the SMS chat phase (in `record-active-sms-run`), deleted when the chat ends or expires (`clear-active-sms-run`). The inbound webhook (`/api/sms-inbound`) reads this to map an inbound phone number back to the parked workflow run, then calls `client.notify('sms-reply-${runId}', { from, body })` to wake it. Cheap; expected size is the count of users currently in the SMS chat phase, bounded by daily active users in the worst case.
 
 ## Mastra SMS Chat Agent (`lib/chat-agent.ts`)
-A Mastra agent using whichever LLM provider already powers the LiveKit voice agent (kept identical so we don't introduce a new key). Background prompt mirrors the voice agent's `<goal>` block — same three KPIs, same exception, same SMS-friendly tone (very short messages, ≤160 chars when possible) — and walks through the per-ritual list passed in via the workflow's invocation payload (same `rituals: [{ googleDocId, label }]` shape the voice agent receives in dispatch metadata). Tools:
-- `recordKPI({ googleDocId: string, field: 'relapse' | 'ritualFulfilled' | 'answeredCall', value: boolean })` — writes to a per-run state object keyed by `googleDocId`. The agent must include the `googleDocId` of the ritual it is currently asking about.
-- `markRitualUsedOut({ googleDocId: string })` — sets `ritualKpis[googleDocId].ritualUsedOut = true`.
-- `complete()` — emits `client.notify("sms-reply-${runId}", { done: true, state })` so the parked workflow can finalize. The agent calls this once every ritual's three KPIs are recorded OR every ritual is marked used-out, whichever comes first.
+Inline Mastra agent — built fresh per turn inside `runChatTurn()` rather than registered to a `new Mastra({ agents: { ... } })` instance. No `getAgentById`, no Mastra Studio wiring; the workflow already owns the canonical state (the `trackingEvents` doc) and we don't need shared memory or observability for a one-shot generate. If we ever want Studio for debugging, we register the agent under a Mastra instance and run `npm run dev` from a `mastra/` subdir — easy retrofit.
 
-The agent runs ONE step per inbound message (driven by the workflow, not in a loop). Each inbound webhook drives one Mastra invocation; the workflow holds the conversation state and the SMS turn budget. Mastra is doing the LLM-side conversation logic, not orchestration.
+Model: `google/gemini-2.5-flash` via Mastra's model router. Pinned to 2.5-flash for the same reason `tracking-agent` is — `gemini-3-flash-preview` requires `thought_signature` on follow-up function-call parts, which the Vercel AI SDK / Mastra wrapper doesn't propagate, breaking multi-tool turns. Mastra reads Google credentials from `GOOGLE_GENERATIVE_AI_API_KEY`; `chat-agent.ts` mirrors `process.env.GOOGLE_API_KEY` to that name at module load so we share one Vercel env var.
+
+Tools (closures over a per-turn `state` object):
+- `recordKPI({ googleDocId: string, field: 'relapse' | 'ritualFulfilled' | 'answeredCall', value: boolean })` — sets `state.kpiUpdates[googleDocId][field] = value`.
+- `markRitualUsedOut({ googleDocId: string })` — sets `state.kpiUpdates[googleDocId].ritualUsedOut = true`.
+- `complete()` — sets `state.done = true`. Does NOT call `client.notify`; the workflow loop reads `done` from the returned `ChatTurnResult` and exits.
+
+Each inbound user reply drives ONE Mastra invocation (`agent.generate(reply, { maxSteps: 2 })`). The workflow:
+1. Computes `remaining` rituals from the latest merged doc via `computeRemaining()` so the agent never re-asks for an already-collected KPI.
+2. Calls `runChatTurn({ language, remaining, userReply })`.
+3. Persists `state.kpiUpdates` via `mergeFinal()` if non-empty.
+4. Sends `state.message` via Telnyx if non-empty.
+5. Loops to next reply unless `state.done` or `allRitualsComplete(merged)`.
+
+The workflow holds the SMS turn budget (`TURN_BUDGET = 6`) and per-turn timeout (`30m`). Mastra is doing the LLM-side conversation logic only; orchestration stays in `lib/workflows/per-user.ts`.
 
 ## Telnyx Integration (`lib/telnyx.ts`)
-- **Outbound:** `POST https://api.telnyx.com/v2/messages` with the user's phone, the message body, and the Telnyx-issued messaging profile. We reuse the existing Telnyx account already used for SIP voice; the messaging profile is a separate setup step (track in `current-plan.md` Phase 1).
-- **Inbound:** Telnyx posts to `/api/sms-inbound` with a signature header. Verify with `TELNYX_PUBLIC_KEY` (Ed25519). Reject unsigned requests.
+- **Outbound:** `client.messages.send({ to, from: process.env.TELNYX_FROM_NUMBER, text })` via the official `telnyx` SDK (lazy-singleton). Phone-number sender (no alpha sender) so the user can reply — the Phase 4 chat loop relies on two-way SMS. Same Telnyx account as SIP voice; the Messaging Profile is a separate setup step in Mission Control.
+- **Inbound:** Telnyx posts JSON to `/api/sms-inbound`. The route reads the raw body string, then calls `verifyInboundSignature(rawBody, headers)` which delegates to `TelnyxWebhook.verify()` (Ed25519 against `TELNYX_PUBLIC_KEY`, the base64 key from Mission Control → Messaging Profiles → Public Key). Rejected requests return 401. After verification the route filters for `event_type === 'message.received'`, looks up `smsActiveRuns/{phoneNumber}`, and calls `workflowClient().notify('sms-reply-${runId}', { from, body: text })`. Inbound from a phone with no active run is logged + dropped (v2 will handle proactive-inbound).
 
 ## Environment Variables
-- `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` — Upstash auth + workflow request verification.
-- `FIREBASE_SERVICE_ACCOUNT_JSON` — base64-encoded service account for Firebase Admin SDK (Vercel doesn't have a path to mount a JSON file; use base64 in env, decode in `lib/firestore.ts`).
-- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` — for `AgentDispatchClient.createDispatch` against the deployed `tracking-agent`. Same project as `my-agent` and `tracking-agent` (`arbor-a93j2951`).
-- `TELNYX_API_KEY`, `TELNYX_PUBLIC_KEY`, `TELNYX_MESSAGING_PROFILE_ID` — for outbound SMS and inbound signature verification.
-- `TRACKING_CALLBACK_URL` — absolute URL of this deployment's `/api/tracking-callback`, embedded in dispatch metadata so the agent knows where to POST. Set per-environment (preview vs. production) in Vercel.
-- `LLM_PROVIDER_KEY` — same key as the LiveKit voice agent uses (e.g. OpenAI key); kept identical to avoid introducing a new credential.
+- `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`, `QSTASH_URL` — Upstash auth + workflow request verification. Auto-injected per environment scope by the Vercel ↔ Upstash integration. Pulling local with `vercel env pull --environment=production .env.local` is mandatory before triggering against prod (dev keys won't validate prod signatures).
+- `FIREBASE_SERVICE_ACCOUNT_JSON` — base64-encoded service account for Firebase Admin SDK (Vercel doesn't mount JSON files; decode in `lib/firestore.ts`).
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` — for `AgentDispatchClient.createDispatch` against the deployed `tracking-agent`. Same project as `narya-agent` and `tracking-agent` (`arbor-a93j2951`).
+- `TELNYX_API_KEY` — bearer token for outbound `messages.send`.
+- `TELNYX_PUBLIC_KEY` — base64 Ed25519 key from Mission Control; verifies inbound webhook signatures.
+- `TELNYX_FROM_NUMBER` — E.164 phone number on the Messaging Profile (e.g. `+15079201622`). Phone-number sender (NOT alpha sender) so users can reply.
+- `TRACKING_CALLBACK_URL` — absolute URL of this deployment's `/api/tracking-callback`, embedded in dispatch metadata so the agent knows where to POST. Set per-environment in Vercel; today this is `https://samwise-tracking.vercel.app/api/tracking-callback`.
+- `GOOGLE_API_KEY` — Gemini key shared with `narya-agent` and `cloud-functions`. `lib/chat-agent.ts` mirrors this to `GOOGLE_GENERATIVE_AI_API_KEY` at module load so Mastra finds it. Don't set both.
 
 ## Style Reference
 Inherits the parent project's `programming-style.md` Shared TypeScript Idioms section verbatim:

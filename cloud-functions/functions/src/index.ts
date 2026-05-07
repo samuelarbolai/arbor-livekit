@@ -443,24 +443,52 @@ const SYNTHESIS_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
-// Lazy-singleton Drive client used to fetch the Google Doc title at
-// registration time. The title becomes the `label` on the rituals doc and
-// the value in `users/{userID}.ritualLabels[googleDocId]`. Auth flows
-// through GOOGLE_APPLICATION_CREDENTIALS (same service account as
-// firebase-admin); the Drive API must be enabled in the GCP project.
+// Lazy-singleton Google APIs auth + clients. Scopes:
+//   - drive: registerNewRitual reads the doc title; createRitualDoc
+//     copies the canonical template into the shared folder.
+//   - documents: createRitualDoc patches the new copy's Metadata
+//     section via documents.batchUpdate (replaceAllText).
+// Auth flows through GOOGLE_APPLICATION_CREDENTIALS (same service
+// account as firebase-admin); both Drive and Docs APIs must be enabled
+// in the GCP project. One auth instance shared across both clients
+// avoids re-initialising the JWT exchange.
+let googleAuth: InstanceType<typeof google.auth.GoogleAuth> | null = null;
 let driveClient: ReturnType<typeof google.drive> | null = null;
+let docsClient: ReturnType<typeof google.docs> | null = null;
+
+/**
+ * Lazy-singleton accessor for the shared GoogleAuth instance.
+ * @return {object} A cached GoogleAuth scoped for Drive + Docs.
+ */
+function getGoogleAuth(): InstanceType<typeof google.auth.GoogleAuth> {
+  if (googleAuth) return googleAuth;
+  googleAuth = new google.auth.GoogleAuth({
+    scopes: [
+      "https://www.googleapis.com/auth/drive",
+      "https://www.googleapis.com/auth/documents",
+    ],
+  });
+  return googleAuth;
+}
 
 /**
  * Lazy-singleton accessor for the Google Drive v3 client.
- * @return {object} A cached drive client.
+ * @return {object} A cached drive client with read+write scope.
  */
 function getDriveClient(): ReturnType<typeof google.drive> {
   if (driveClient) return driveClient;
-  const auth = new google.auth.GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-  });
-  driveClient = google.drive({version: "v3", auth});
+  driveClient = google.drive({version: "v3", auth: getGoogleAuth()});
   return driveClient;
+}
+
+/**
+ * Lazy-singleton accessor for the Google Docs v1 client.
+ * @return {object} A cached docs client.
+ */
+function getDocsClient(): ReturnType<typeof google.docs> {
+  if (docsClient) return docsClient;
+  docsClient = google.docs({version: "v1", auth: getGoogleAuth()});
+  return docsClient;
 }
 
 /**
@@ -850,6 +878,208 @@ export const registerNewRitual = onRequest((req, res) => {
     } catch (error) {
       logger.error("Unexpected error in registerNewRitual:", error);
       res.status(500).send({error: "Internal Server Error."});
+    }
+  });
+});
+
+/**
+ * createRitualDoc (HTTP)
+ *
+ * Body: {
+ *   userID: string, voiceID: string, language: string,
+ *   phoneNumber: string, timeZone: string, title?: string
+ * }
+ *
+ * Generates a fresh ritual Google Doc from the canonical template
+ * with the Metadata section pre-filled. Three steps:
+ *   1. drive.files.copy — copy RITUAL_TEMPLATE_DOC_ID into
+ *      RITUAL_PARENT_FOLDER_ID. The service account is OWNER; the
+ *      operator already has access because they own the parent
+ *      folder (no email-share needed in v2 of this function).
+ *   2. docs.documents.batchUpdate — replaceAllText for each of the
+ *      five metadata keys, swapping the empty curly-quote placeholder
+ *      ("") for the supplied value wrapped in straight quotes (which
+ *      is what registerNewRitual's regex parser expects).
+ *   3. Return { documentId, documentUrl }.
+ *
+ * No Firestore writes here. The operator opens the returned URL,
+ * fills in the Problem-Solution and Ritual Call sections, copies the
+ * URL back into the "Register New Ritual" form on samwise-app, and
+ * registerNewRitual takes over from there.
+ *
+ * Why curly-to-straight quote substitution: the canonical template
+ * was authored in Google Docs which auto-converts straight quotes to
+ * smart/curly. The Docs API insertion path bypasses that conversion,
+ * so we can deliberately write straight quotes back in. Without this
+ * the registration regex (which uses straight " in its character
+ * class) would capture the curly quotes as part of the value and
+ * corrupt all five fields downstream.
+ *
+ * Required env vars (set in cloud-functions/.env):
+ *   RITUAL_TEMPLATE_DOC_ID  — Google Doc ID of the canonical template.
+ *                             Must be shared with the service account
+ *                             email as Reader.
+ *   RITUAL_PARENT_FOLDER_ID — Drive folder ID where new docs land.
+ *                             Must be shared with the service account
+ *                             email as Editor. Operator owns it.
+ */
+export const createRitualDoc = onRequest((req, res) => {
+  corsHandler(req, res, async () => {
+    if (req.method !== "POST") {
+      res.status(405).send({error: "Method Not Allowed"});
+      return;
+    }
+
+    interface CreateDocRequest {
+      userID: string;
+      voiceID: string;
+      language: string;
+      phoneNumber: string;
+      timeZone: string;
+      title?: string;
+    }
+
+    try {
+      const body = req.body as CreateDocRequest;
+
+      // Validate the five required metadata fields. Each becomes a
+      // value the registration parser will read back later, so empty
+      // strings or wrong types here would silently break that step.
+      const required: Array<keyof CreateDocRequest> = [
+        "userID",
+        "voiceID",
+        "language",
+        "phoneNumber",
+        "timeZone",
+      ];
+      const missing = required.filter(
+        (k) => !body?.[k] || typeof body[k] !== "string" ||
+          (body[k] as string).trim() === ""
+      );
+      if (missing.length > 0) {
+        res.status(400).send({
+          error: `Missing required field(s): ${missing.join(", ")}`,
+        });
+        return;
+      }
+
+      // E.164 sanity check on phone — registerNewRitual eventually
+      // hands this to the LiveKit SIP path which is strict about it.
+      const phoneE164 = /^\+[1-9]\d{6,14}$/;
+      if (!phoneE164.test(body.phoneNumber.trim())) {
+        res.status(400).send({
+          error: "phoneNumber must be E.164, e.g. +573168248411",
+        });
+        return;
+      }
+
+      const templateId = process.env.RITUAL_TEMPLATE_DOC_ID;
+      const parentFolderId = process.env.RITUAL_PARENT_FOLDER_ID;
+      if (!templateId || !parentFolderId) {
+        logger.error(
+          "createRitualDoc: missing RITUAL_TEMPLATE_DOC_ID or " +
+          "RITUAL_PARENT_FOLDER_ID env vars"
+        );
+        res.status(500).send({error: "Server misconfigured"});
+        return;
+      }
+
+      const userID = body.userID.trim();
+      const voiceID = body.voiceID.trim();
+      const language = body.language.trim();
+      const phoneNumber = body.phoneNumber.trim();
+      const timeZone = body.timeZone.trim();
+
+      // Default title makes the doc findable in Drive — userID + date
+      // is unambiguous and re-running for the same user on a later
+      // day produces a distinct title.
+      const docTitle =
+        body.title?.trim() ||
+        `Samwise Ritual — ${userID} — ` +
+        new Date().toISOString().slice(0, 10);
+
+      const drive = getDriveClient();
+      const docs = getDocsClient();
+
+      // 1. Copy the template into the parent folder. `parents` here
+      //    moves the new file into our owned folder rather than the
+      //    service account's root.
+      const copyResp = await drive.files.copy({
+        fileId: templateId,
+        requestBody: {
+          name: docTitle,
+          parents: [parentFolderId],
+        },
+        supportsAllDrives: true,
+        fields: "id, webViewLink",
+      });
+
+      const documentId = copyResp.data.id;
+      const documentUrl =
+        copyResp.data.webViewLink ??
+        `https://docs.google.com/document/d/${documentId}/edit`;
+
+      if (!documentId) {
+        logger.error("createRitualDoc: Drive copy returned no id");
+        res.status(500).send({error: "Failed to create doc"});
+        return;
+      }
+
+      // 2. Pre-fill Metadata section. The template ships with empty
+      //    curly-quote placeholders authored in Google Docs (e.g.
+      //    `userID: ""` with U+201C/U+201D). We match those literals
+      //    and replace with straight-quote values that the
+      //    registration regex parses cleanly. matchCase=true is
+      //    defensive — these keys are case-sensitive identifiers.
+      const LCURLY = "“"; // "
+      const RCURLY = "”"; // "
+      const fields: Array<[string, string]> = [
+        ["userID", userID],
+        ["voiceID", voiceID],
+        ["language", language],
+        ["phoneNumber", phoneNumber],
+        ["timeZone", timeZone],
+      ];
+      const replaceRequests = fields.map(([key, value]) => ({
+        replaceAllText: {
+          containsText: {
+            text: `${key}: ${LCURLY}${RCURLY}`,
+            matchCase: true,
+          },
+          replaceText: `${key}: "${value}"`,
+        },
+      }));
+      const batchResp = await docs.documents.batchUpdate({
+        documentId,
+        requestBody: {requests: replaceRequests},
+      });
+      // Each replaceAllText reply has occurrencesChanged. If any are
+      // 0 the placeholder didn't match — almost always means the
+      // template has been edited (different quote chars, missing
+      // line). Log so the operator can fix the template; don't fail
+      // the request because the doc is already created.
+      const replies = batchResp.data.replies ?? [];
+      replies.forEach((reply, i) => {
+        const changed = reply.replaceAllText?.occurrencesChanged ?? 0;
+        if (changed === 0) {
+          logger.warn(
+            `createRitualDoc: ${fields[i][0]} placeholder not ` +
+            "matched in template — operator should fill manually"
+          );
+        }
+      });
+
+      logger.info(
+        `createRitualDoc: created ${documentId} for userID ${userID}`
+      );
+      res.status(200).send({
+        message: "Ritual doc created",
+        documentId,
+        documentUrl,
+      });
+    } catch (error) {
+      logger.error("createRitualDoc: unexpected error", error);
+      res.status(500).send({error: "Internal Server Error"});
     }
   });
 });
