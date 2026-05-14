@@ -1,13 +1,49 @@
 import { voice, llm } from '@livekit/agents';
-import { RoomServiceClient } from 'livekit-server-sdk';
-import { type JobContext, getJobContext } from '@livekit/agents';
-import {getFirestore, FieldValue} from "firebase-admin/firestore";
+import { type JobContext } from '@livekit/agents';
+import { ReadableStream, TransformStream } from 'node:stream/web';
 import { z } from 'zod';
+
+// Strip parenthetical stage directions like "(pausa)", "[breath]", "*sighs*"
+// from the assistant's text before it reaches the TTS engine. Cartesia reads
+// any literal text it receives, so a stray "(pausa)" would be pronounced as
+// the word "pausa". The system prompt already tells the LLM not to emit these,
+// but this is a belt-and-suspenders backstop for when the model slips.
+// Stream-safe: buffers across chunks so a "(pa" + "usa)" split still strips.
+const STAGE_DIRECTION = /[(\[*][^)\]*\n]{0,40}[)\]*]/g;
+function stripStageDirections(): TransformStream<string, string> {
+  let buffer = '';
+  return new TransformStream<string, string>({
+    transform(chunk, controller) {
+      buffer += chunk;
+      const lastOpen = Math.max(buffer.lastIndexOf('('), buffer.lastIndexOf('['));
+      if (lastOpen === -1 || /[)\]]/.test(buffer.slice(lastOpen))) {
+        controller.enqueue(buffer.replace(STAGE_DIRECTION, ''));
+        buffer = '';
+        return;
+      }
+      const head = buffer.slice(0, lastOpen).replace(STAGE_DIRECTION, '');
+      if (head) controller.enqueue(head);
+      buffer = buffer.slice(lastOpen);
+      if (buffer.length > 200) {
+        // safety valve — never seen a closing bracket, give up and pass through
+        controller.enqueue(buffer);
+        buffer = '';
+      }
+    },
+    flush(controller) {
+      if (buffer) controller.enqueue(buffer.replace(STAGE_DIRECTION, ''));
+    },
+  });
+}
 
 // Define a custom voice AI assistant by extending the base Agent class
 export class Agent extends voice.Agent {
 
-  constructor(chatCtx: llm.ChatContext, jobCtx: JobContext) {
+  constructor(
+    chatCtx: llm.ChatContext,
+    jobCtx: JobContext,
+    onVoicemailDetected: () => void,
+  ) {
     super({
       chatCtx,
       instructions: `
@@ -22,7 +58,7 @@ export class Agent extends voice.Agent {
 
 
    <environment>
-       The user is interacting with you via voice, even if you perceive the conversation as text. Your responses are concise, to the point, and without any complex formatting or punctuation, including emojis, asterisks, or other symbols.
+       The user is interacting with you via voice. Everything you write is spoken aloud by a text-to-speech engine, verbatim and literally. Never include stage directions, scene notes, or pacing labels in parentheses, brackets, asterisks, or any other form — for example, NEVER write "(pausa)", "(pause)", "(silencio)", "[breath]", "*sighs*", or similar. If you write them, the listener will hear those words pronounced out loud, which is broken. Your output must contain only the words you actually want spoken. No emojis, no markdown, no XML tags, no symbols.
        The user may be experiencing service disruptions and could be frustrated with how the day is going.
    </environment>
 
@@ -30,7 +66,7 @@ export class Agent extends voice.Agent {
    <tone and style>
        Keep responses clear and concise (2-3 sentences unless telling a story or explaining a concept requires more detail).
        Use a calm, authoritative yet compassionate tone with mesianic open ended invitations ("Leave what you are carrying, and follow.", "Come, and you will see", "What are you looking for?").
-       Speak slowly and use many pauses during your replies.
+       Speak slowly. Convey pauses ONLY through natural punctuation — commas for short pauses, periods for medium ones, ellipses ("...") for longer reflective ones. Never label a pause with words; the TTS handles silence based on punctuation.
        You ask questions before starting each step, in order to understand where the user is emotionally.
        You help the user arrive at each step of the session by themselves, instead of imposing the session.
        Use stories to guide the user when they show signs of confusion. Similar to the way Jesus did to make a point.
@@ -47,8 +83,11 @@ export class Agent extends voice.Agent {
 
 
        -> Prepare the user for the session:
-       Greet the user very briefly with a simple hello.
-       Tell them that it is up to them to actually take advantage of this session because you are just a tool, like a bible or a philosophical framework.
+       Greet the user very briefly with a simple hello. 
+       Ask them if they are listening well. Wait for their reply.
+       Remind them of their core motivation very quickly. Wait for their reply.
+       Tell them that it is up to them to actually take advantage of this session because you are just a tool, like a bible or a philosophical framework. Wait for their reply. 
+
 
 
        -> Start the session:
@@ -94,34 +133,29 @@ export class Agent extends voice.Agent {
       //   }),
       // },
       tools: {
-            leaveVoicemail: llm.tool({
-                description: 'Call this tool whenever you detect a voicemail or an unresponsive caller in the first interaction. Add the user ID to a fallback list in Firestore for later follow-up.',
-                parameters: z.object({
-                  userID: z
-                      .string()
-                      .describe('The user ID to add to the voicemail list in Firestore'),
-                }),
-                execute: async ({ userID }) => {
-                  console.log('Detected voicemail greeting, shutting down the agent.')
-                  const db = getFirestore();
-                  const docref = db.doc("D6BkPWFjMbTfCotrnOUj");
-                  await docref.update({
-                    usersIDs: FieldValue.arrayUnion(userID),
-                  });
-                  console.log(`Added user ${userID} to the fallback list in Firestore.`);
-
-                  const jobContext = getJobContext();
-                  if (!jobContext) return;
-                  const roomServiceClient = new RoomServiceClient(
-                    process.env.LIVEKIT_URL!,
-                    process.env.LIVEKIT_API_KEY!,
-                    process.env.LIVEKIT_API_SECRET!,
-                  );
-
-                  await roomServiceClient.deleteRoom(jobContext.room.name!);
-                },
-            }),  
+        leaveVoicemail: llm.tool({
+          description: `Call this tool exactly once, and only when you are confident the call has reached a voicemail or automated phone-menu system (e.g. "leave your message after the tone", "press 1 to listen, 2 to re-record", "you have reached the voicemail of..."). After calling it, stop speaking — do not call it again. Do NOT call this tool during a normal conversation with a human.`,
+          parameters: z.object({}),
+          execute: async () => {
+            try {
+              onVoicemailDetected();
+              jobCtx.shutdown('voicemail_detected');
+              return 'voicemail_acknowledged_shutting_down';
+            } catch (err) {
+              console.error('leaveVoicemail handler failed:', err);
+              return 'voicemail_acknowledged_with_warning';
+            }
           },
+        }),
+      },
     });
+  }
+
+  override async ttsNode(
+    text: ReadableStream<string>,
+    modelSettings: voice.ModelSettings,
+  ) {
+    const stripped = text.pipeThrough(stripStageDirections());
+    return voice.Agent.default.ttsNode(this, stripped, modelSettings);
   }
 }

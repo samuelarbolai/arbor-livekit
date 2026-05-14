@@ -13,6 +13,7 @@ import {onRequest} from "firebase-functions/https";
 import * as logger from "firebase-functions/logger";
 import {getFirestore, FieldValue} from "firebase-admin/firestore";
 import {onSchedule} from "firebase-functions/v2/scheduler";
+import {randomBytes} from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import {google} from "googleapis";
@@ -31,6 +32,17 @@ import {google} from "googleapis";
 // In the v1 API, each function can only serve one request per container, so
 // this will be the maximum concurrent request count.
 setGlobalOptions({maxInstances: 10});
+
+/**
+ * Reads an environment variable and throws if it is missing or empty.
+ * @param {string} name The env var name.
+ * @return {string} The env var value.
+ */
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required env var: ${name}`);
+  return value;
+}
 
 // =============================================================================
 // Overview
@@ -103,9 +115,9 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
 
   const batchPayload = <AgentConfig[]>[];
 
-  const LIVEKIT_URL = process.env.LIVEKIT_URL!;
-  const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY!;
-  const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET!;
+  const LIVEKIT_URL = requireEnv("LIVEKIT_URL");
+  const LIVEKIT_API_KEY = requireEnv("LIVEKIT_API_KEY");
+  const LIVEKIT_API_SECRET = requireEnv("LIVEKIT_API_SECRET");
 
   const agentDispatchClient = new AgentDispatchClient(
     LIVEKIT_URL,
@@ -113,7 +125,7 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
     LIVEKIT_API_SECRET
   );
 
-  const agentName = "my-agent";
+  const agentName = "ritual-agent";
 
   /**
    * Initiates a single outbound SIP call with agent dispatch.
@@ -298,7 +310,7 @@ export const makeCallsBatchFunction = onRequest(async (req, res) => {
 export const checkUsersRituals = onSchedule({
   schedule: "0,30 * * * *",
   timeZone: "America/Bogota",
-}, async (event) => {
+}, async () => {
   /*
   NOTE FOR FUTURE SELF:
   When we got a user from another timezone,
@@ -538,6 +550,7 @@ export const registerNewRitual = onRequest((req, res) => {
       phoneNumber: string;
       userInputs: string;
       voiceID: string;
+      userID: string;
     }
 
     interface RitualData {
@@ -670,14 +683,19 @@ export const registerNewRitual = onRequest((req, res) => {
       ];
       const metadata: Partial<Metadata> = {};
       const missingMetadataKeys: string[] = [];
+      // Strip surrounding straight or smart quotes (Google Docs auto-
+      // converts " to U+201C/U+201D), plus stray whitespace.
+      const stripQuotes = (s: string) =>
+        s.replace(/^[\s"“”'‘’]+|[\s"“”'‘’]+$/g, "");
       for (const key of requiredMetadataKeys) {
         const re = new RegExp(
-          `^\\s*${key}\\s*:\\s*"?([^"\\r\\n]+?)"?\\s*$`,
+          `^\\s*${key}\\s*:\\s*(.+?)\\s*$`,
           "m"
         );
         const match = docContent.match(re);
-        if (match && match[1]) {
-          metadata[key] = match[1];
+        const value = match && match[1] ? stripQuotes(match[1]) : "";
+        if (value) {
+          metadata[key] = value;
         } else {
           missingMetadataKeys.push(key);
         }
@@ -711,7 +729,7 @@ export const registerNewRitual = onRequest((req, res) => {
         () => enrichedDocContent
       );
 
-      const GEMINI_KEY = process.env.GEMINI_KEY!;
+      const GEMINI_KEY = requireEnv("GEMINI_KEY");
       const genAI = new GoogleGenerativeAI(GEMINI_KEY);
       const model = genAI.getGenerativeModel({
         model: "gemini-2.5-flash",
@@ -731,6 +749,7 @@ export const registerNewRitual = onRequest((req, res) => {
         // this code change; once the prompt is updated it will always
         // be present. Falls back to the Google Doc title.
         behaviorLabel?: string;
+        userID: string;
       }
       let synthesis: SynthesisResult;
       try {
@@ -753,6 +772,7 @@ export const registerNewRitual = onRequest((req, res) => {
           phoneNumber: meta.phoneNumber,
           userInputs: synthesis.userInputs,
           voiceID: meta.voiceID,
+          userID: meta.userID,
         },
         fallbackSchedules: synthesis.fallbackSchedules ?? [],
         fallbackActive: false,
@@ -785,8 +805,10 @@ export const registerNewRitual = onRequest((req, res) => {
         const existingDoc = docIdSnapshot.docs[0];
         const existingData = existingDoc.data();
 
-        // Preserve existing userID
+        // Preserve existing userID on both top-level and agentConfig so
+        // dispatch metadata stays in sync with the canonical identity.
         ritualData.userID = existingData.userID;
+        ritualData.agentConfig.userID = existingData.userID;
 
         logger.info(
           `Updating existing ritual with ID: ${existingDoc.id} ` +
@@ -857,6 +879,7 @@ export const registerNewRitual = onRequest((req, res) => {
       }
 
       ritualData.userID = canonicalUserId;
+      ritualData.agentConfig.userID = canonicalUserId;
       ritualData.agentConfig.phoneNumber = canonicalPhoneNumber;
 
       // Save to Firestore
@@ -886,12 +909,17 @@ export const registerNewRitual = onRequest((req, res) => {
  * createRitualDoc (HTTP)
  *
  * Body: {
- *   userID: string, voiceID: string, language: string,
+ *   name: string, voiceID: string, language: string,
  *   phoneNumber: string, timeZone: string, title?: string
  * }
  *
  * Generates a fresh ritual Google Doc from the canonical template
- * with the Metadata section pre-filled. Three steps:
+ * with the Metadata section pre-filled. The userID is generated
+ * server-side as a 28-char base62 string (Firebase-Auth-UID-shaped)
+ * — the operator only supplies a human-readable `name`, used in the
+ * doc title for findability.
+ *
+ * Three steps:
  *   1. drive.files.copy — copy RITUAL_TEMPLATE_DOC_ID into
  *      RITUAL_PARENT_FOLDER_ID. The service account is OWNER; the
  *      operator already has access because they own the parent
@@ -899,8 +927,9 @@ export const registerNewRitual = onRequest((req, res) => {
  *   2. docs.documents.batchUpdate — replaceAllText for each of the
  *      five metadata keys, swapping the empty curly-quote placeholder
  *      ("") for the supplied value wrapped in straight quotes (which
- *      is what registerNewRitual's regex parser expects).
- *   3. Return { documentId, documentUrl }.
+ *      is what registerNewRitual's regex parser expects). userID is
+ *      the freshly generated random ID; the others are from the body.
+ *   3. Return { documentId, documentUrl, userID }.
  *
  * No Firestore writes here. The operator opens the returned URL,
  * fills in the Problem-Solution and Ritual Call sections, copies the
@@ -923,6 +952,26 @@ export const registerNewRitual = onRequest((req, res) => {
  *                             Must be shared with the service account
  *                             email as Editor. Operator owns it.
  */
+/**
+ * Generate a random 28-character base62 userID. Shape mirrors a
+ * real Firebase Auth UID (28 chars, alphanumeric) so the rest of the
+ * stack — Firestore doc IDs, dispatch metadata, log lines — looks
+ * uniform across operator-created and Auth-issued users. Modulo bias
+ * is negligible for this use case (a tiny lean toward A–H); entropy
+ * is still well over 100 bits.
+ * @return {string} 28-character base62 string.
+ */
+function generateUserId(): string {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = randomBytes(28);
+  let result = "";
+  for (let i = 0; i < 28; i++) {
+    result += alphabet[bytes[i] % 62];
+  }
+  return result;
+}
+
 export const createRitualDoc = onRequest((req, res) => {
   corsHandler(req, res, async () => {
     if (req.method !== "POST") {
@@ -931,7 +980,7 @@ export const createRitualDoc = onRequest((req, res) => {
     }
 
     interface CreateDocRequest {
-      userID: string;
+      name: string;
       voiceID: string;
       language: string;
       phoneNumber: string;
@@ -942,11 +991,10 @@ export const createRitualDoc = onRequest((req, res) => {
     try {
       const body = req.body as CreateDocRequest;
 
-      // Validate the five required metadata fields. Each becomes a
-      // value the registration parser will read back later, so empty
-      // strings or wrong types here would silently break that step.
+      // Validate the five required input fields. `userID` is no
+      // longer in this list — it's generated server-side below.
       const required: Array<keyof CreateDocRequest> = [
-        "userID",
+        "name",
         "voiceID",
         "language",
         "phoneNumber",
@@ -984,18 +1032,20 @@ export const createRitualDoc = onRequest((req, res) => {
         return;
       }
 
-      const userID = body.userID.trim();
+      const userID = generateUserId();
+      const name = body.name.trim();
       const voiceID = body.voiceID.trim();
       const language = body.language.trim();
       const phoneNumber = body.phoneNumber.trim();
       const timeZone = body.timeZone.trim();
 
-      // Default title makes the doc findable in Drive — userID + date
-      // is unambiguous and re-running for the same user on a later
-      // day produces a distinct title.
+      // Default title makes the doc findable in Drive — name + date
+      // is human-readable and stable enough that re-running for the
+      // same user on a later day produces a distinct title without
+      // colliding visually with the previous run.
       const docTitle =
         body.title?.trim() ||
-        `Samwise Ritual — ${userID} — ` +
+        `Samwise Ritual — ${name} — ` +
         new Date().toISOString().slice(0, 10);
 
       const drive = getDriveClient();
@@ -1070,12 +1120,14 @@ export const createRitualDoc = onRequest((req, res) => {
       });
 
       logger.info(
-        `createRitualDoc: created ${documentId} for userID ${userID}`
+        `createRitualDoc: created ${documentId} for ${name} ` +
+        `(userID ${userID})`
       );
       res.status(200).send({
         message: "Ritual doc created",
         documentId,
         documentUrl,
+        userID,
       });
     } catch (error) {
       logger.error("createRitualDoc: unexpected error", error);

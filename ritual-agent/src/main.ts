@@ -166,6 +166,7 @@ export default defineAgent({
     // });
 
     let userTurnCount = 0;
+    let voicemailDetected = false;
 
     session.on(
       voice.AgentSessionEventTypes.ConversationItemAdded,
@@ -177,7 +178,9 @@ export default defineAgent({
     );
 
     ctx.addShutdownCallback(async () => {
-      if (userTurnCount === 0) {
+      if (voicemailDetected) {
+        await setFallbackActive('voicemail_detected', userID, true);
+      } else if (userTurnCount === 0) {
         await setFallbackActive('no_user_turns', userID, true);
       } else {
         await setFallbackActive('no_user_turns', userID, false);
@@ -203,7 +206,9 @@ export default defineAgent({
 
     // Start the session, which initializes the voice pipeline and warms up the models
     await session.start({
-      agent: new Agent(initialCtx, ctx),
+      agent: new Agent(initialCtx, ctx, () => {
+        voicemailDetected = true;
+      }),
       room: ctx.room,
       inputOptions: {
         // LiveKit Cloud enhanced noise cancellation

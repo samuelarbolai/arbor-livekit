@@ -9,6 +9,9 @@ The numbered headings below correspond to tab names.
 ## 1. Problem - Solution
 
 ```
+I am ******
+My core motivation is ******
+
 Problem
 
 * Self-destructive behaviour: *******
@@ -22,6 +25,8 @@ Ritual
 ```
 
 The therapist's framing of the user's situation. Use the user's own metaphor for the core problem ("the disease", "the noise", "the bleeding") — never a clinical label. The synthesis prompt is told to preserve detachment framing as a deliberate psychological tool.
+
+`My core motivation is ******` is the user's personal, life-stakes "because" — what they stand to gain or lose in their actual life if they do or do not change. Distinct from the Solution/Ritual transformation arc: this is the gut-level reason they showed up. The conversational agent reads it back to the user at the very start of the call, so write it in the user's own voice (first person) and keep it to one to three sentences that read well aloud. Preserve their detachment metaphor here too.
 
 For timing, write in plain language ("every night at 9 PM", "weekdays at 7:30 AM"). Gemini converts it to `DAY_HH:MM` keys with a `:00` or `:30` boundary. **Off-boundary times silently never fire.**
 
