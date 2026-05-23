@@ -1,0 +1,57 @@
+You are parsing a sales-call script into structured phases for a copilot UI.
+
+The script is a Google Doc with EXPLICIT MARKERS for spoken text. Text wrapped in [SAY]...[/SAY] is what the rep reads aloud to the prospect. Everything else inside a phase — labels, stage directions, parenthetical asides, "Capture: …" instructions, tables, headings — is rep-only guidance.
+
+You do NOT classify say vs note. The markers do that for you. Your job is to:
+  1. Identify the scriptType.
+  2. Find the phase boundaries.
+  3. Split each phase's body into alternating "say" blocks (inside the markers) and "note" blocks (outside the markers), in document order.
+
+Return ONLY a JSON object with this exact shape:
+
+{
+  "scriptType": "demo" | "onboarding" | "call_design" | "unknown",
+  "phases": [
+    {
+      "number": "pre-call" | "post-call" | 1 | 2 | 3 | ...,
+      "title": "...",
+      "blocks": [
+        { "kind": "say" | "note", "text": "..." },
+        ...
+      ]
+    },
+    ...
+  ]
+}
+
+RULES:
+1. Identify scriptType from the Doc title AND content:
+   - "demo" if the script is a Compatibility & Welcome / Demo call (rep persona, fit assessment, pricing phases).
+   - "onboarding" if it's the Dra. Ana María clinician onboarding (unsettling_reality, enemy_name, mantra).
+   - "call_design" if it's the Call Design / Ritual design session (symbolic_invocation, gratitude_items, pact).
+   - "unknown" otherwise.
+
+2. Phase boundaries: each phase is introduced by a heading like "Phase 1 — …", "Phase 1.5 — …", "Phase 2 — …", "After the call …" (treat as "post-call"), or a "Pre-call" section (treat as "pre-call"). Numbered phases use integers (or decimals like 1.5 as strings — but integers preferred when possible; if the heading is "Phase 1.5", emit number as the string "1.5").
+
+3. Split each phase's body into BLOCKS using the [SAY] / [/SAY] markers DETERMINISTICALLY:
+   - Text between a [SAY] and its matching [/SAY] = one "say" block.
+   - Text outside any [SAY]/[/SAY] pair but inside the phase = "note" block.
+   - Strip the [SAY] and [/SAY] tokens themselves from block text. The output text must NEVER contain the literal "[SAY]" or "[/SAY]" strings.
+   - Adjacent same-kind content (e.g. two consecutive note paragraphs) merges into one block.
+   - Drop empty or whitespace-only blocks.
+   - If a [SAY] is missing its closing [/SAY] before the next phase, treat everything until the next phase boundary as a say block.
+
+4. Preserve all {{variable_name}} placeholders inside block text EXACTLY. Never expand them.
+
+5. Preserve newlines and basic paragraph structure inside a block (use \n).
+
+6. Do NOT add explanatory text outside the JSON. The response must parse with JSON.parse().
+
+7. If you cannot find any phase markers, return scriptType="unknown" and phases=[].
+
+DOC TITLE: {{DOC_TITLE}}
+
+DOC CONTENT:
+{{DOC_CONTENT}}
+
+JSON OUTPUT:
