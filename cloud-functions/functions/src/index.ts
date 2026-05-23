@@ -455,6 +455,15 @@ const SYNTHESIS_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
+// Phase-extraction prompt used by loadCallScript. Same loading pattern as
+// SYNTHESIS_PROMPT above — the build script copies the .txt file to lib/
+// so __dirname resolution works at runtime. Edits to this prompt are
+// free-form (no skill governs it) — it's a small JSON-out parsing task.
+const LOAD_SCRIPT_PROMPT = fs.readFileSync(
+  path.join(__dirname, "load_call_script_prompt.txt"),
+  "utf-8"
+);
+
 // Lazy-singleton Google APIs auth + clients. Scopes:
 //   - drive: registerNewRitual reads the doc title; createRitualDoc
 //     copies the canonical template into the shared folder.
@@ -478,6 +487,7 @@ function getGoogleAuth(): InstanceType<typeof google.auth.GoogleAuth> {
     scopes: [
       "https://www.googleapis.com/auth/drive",
       "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/spreadsheets",
     ],
   });
   return googleAuth;
@@ -1135,3 +1145,500 @@ export const createRitualDoc = onRequest((req, res) => {
     }
   });
 });
+
+// =============================================================================
+// Session-copilot (Demo Call) HTTP functions
+// -----------------------------------------------------------------------------
+// Three small functions that back the /copilot route in samwise-app:
+//
+//   1. loadCallScript      — fetches a script Google Doc, asks Gemini to
+//                            parse it into {scriptType, phases[]}.
+//   2. cleanVariable       — per-field denoising of a rep's raw mid-call
+//                            note. Stateless. Falls back to rawValue on any
+//                            error so the frontend never blocks on cleaning.
+//   3. appendDemoCallRow   — appends one row to the funnel sheet's "Comp
+//                            call" tab via the Sheets API.
+//
+// All three reuse the lazy-singleton Google auth declared above; the
+// spreadsheets scope was added there. The frontend ships under
+// samwise-app/app/copilot/ and samwise-app/lib/copilot/. The frontend's
+// FUNNEL_SHEET_COLUMNS and this file's DEMO_CALL_COLUMNS must stay in
+// sync — drift will land cells in wrong columns.
+// =============================================================================
+
+/**
+ * Extracts the Google Doc ID from any /document/d/<ID>/... URL form.
+ * @param {string} url Doc URL.
+ * @return {string} The Doc ID.
+ */
+function extractDocId(url: string): string {
+  const m = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
+  if (!m) throw new Error(`Could not extract Doc ID from: ${url}`);
+  return m[1];
+}
+
+/**
+ * Flattens a Google Doc body's `content` array to plain text. Headings,
+ * paragraphs, and table cells are concatenated with line breaks.
+ * @param {Array} content Doc structural elements.
+ * @return {string} Flat plain-text representation.
+ */
+function flattenDocToText(content: Array<unknown>): string {
+  const lines: string[] = [];
+  for (const el of content as Array<{
+    paragraph?: {elements?: Array<{textRun?: {content?: string}}>};
+    table?: {
+      tableRows?: Array<{tableCells?: Array<{content?: Array<unknown>}>}>;
+    };
+  }>) {
+    if (el.paragraph?.elements) {
+      const line = el.paragraph.elements
+        .map((e) => e.textRun?.content ?? "")
+        .join("");
+      lines.push(line);
+    } else if (el.table?.tableRows) {
+      for (const row of el.table.tableRows) {
+        for (const cell of row.tableCells ?? []) {
+          lines.push(flattenDocToText(cell.content ?? []));
+        }
+      }
+    }
+  }
+  return lines.join("");
+}
+
+/**
+ * loadCallScript (HTTP)
+ *
+ * Body: { googleDocLink: string }
+ *
+ * Reads the Doc via the Google Docs API, asks Gemini to parse it into a
+ * phases array, returns { scriptType, phases }. Mirrors registerNewRitual's
+ * shape but with a phase-extraction prompt instead of a synthesis prompt.
+ *
+ * Used by samwise-app/app/copilot/ at session start.
+ */
+export const loadCallScript = onRequest(
+  {cors: true, timeoutSeconds: 120},
+  async (req, res) => {
+  interface LoadCallScriptBody {
+    googleDocLink: string;
+  }
+
+  try {
+    const {googleDocLink} = req.body as LoadCallScriptBody;
+    if (!googleDocLink) {
+      res.status(400).json({error: "googleDocLink required"});
+      return;
+    }
+
+    const docId = extractDocId(googleDocLink);
+    const docs = getDocsClient();
+    const doc = await docs.documents.get({documentId: docId});
+
+    const title = doc.data.title ?? "";
+    const content = flattenDocToText(doc.data.body?.content ?? []);
+
+    const filledPrompt = LOAD_SCRIPT_PROMPT
+      .replace("{{DOC_TITLE}}", title)
+      .replace("{{DOC_CONTENT}}", content);
+
+    const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+    const model = gemini.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      generationConfig: {responseMimeType: "application/json"},
+    });
+    const result = await model.generateContent(filledPrompt);
+    const text = result.response.text();
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      logger.error("loadCallScript: Gemini returned non-JSON", {text});
+      res.status(502).json({error: "Gemini returned non-JSON"});
+      return;
+    }
+
+    res.status(200).json(parsed);
+  } catch (err) {
+    logger.error("loadCallScript failed", err);
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({error: message});
+  }
+  }
+);
+
+/* eslint-disable max-len */
+/**
+ * Builds the script-context-aware cleaning prompt for cleanVariable.
+ * The cleaner's job is to produce a phrase that fits naturally into the
+ * specific script slots where this variable is substituted — not a
+ * generic canonical form. When no script slots exist (e.g. post-call
+ * variables that never appear in spoken text), the prompt falls back
+ * to a "produce a clean version" instruction.
+ * @param {object} body Cleaning request body.
+ * @return {string} The full prompt to send to Gemini.
+ */
+function buildCleanVariablePrompt(body: {
+  name: string;
+  rawValue: string;
+  frameworkSemantics?: string;
+  scriptContexts?: string[];
+  otherVariables?: Record<string, string>;
+}): string {
+  const semantics = body.frameworkSemantics?.trim() ||
+    "A free-text variable captured by the rep. Produce a concise, " +
+    "grammatical, substitutable version in the language the rep typed.";
+
+  const contexts = body.scriptContexts ?? [];
+  const contextBlock = contexts.length > 0 ?
+    `SCRIPT SLOTS where {{${body.name}}} appears (the rep reads these aloud):
+${contexts.map((c) => `  - "${c}"`).join("\n")}
+
+Your output MUST fit naturally into ALL these slots. Mentally substitute it into each and check that it reads grammatically and conversationally. The output language is the language of the slots above; if the rep typed in a different language, translate.` :
+    "This variable does NOT appear in any spoken script slot. Produce a clean, concise version in the language the rep typed. No need to optimize for grammatical fit.";
+
+  // Cross-variable context for disambiguation. If the rep's raw note
+  // contains a word with multiple senses (e.g. "defaulting" = settling-
+  // for-default vs. breaching), other captured variables usually
+  // disambiguate (e.g. core_motivation mentioning relationships → pick
+  // the romantic sense, not the financial-breach sense).
+  const others = body.otherVariables ?? {};
+  const filteredOthers = Object.entries(others)
+    .filter(([k, v]) => k !== body.name && typeof v === "string" && v.trim())
+    .slice(0, 30); // hard cap
+  const otherBlock = filteredOthers.length > 0 ?
+    `
+OTHER VARIABLES ALREADY CAPTURED FOR THIS PROSPECT (use ONLY to disambiguate the rep's words — what world is the prospect in, what's at stake for them, what's the register of their language? Do NOT pull content from these into your output for ${body.name}; that content belongs to those other variables):
+${filteredOthers.map(([k, v]) => `  - ${k}: ${v}`).join("\n")}
+` :
+    "";
+
+  return `You are cleaning a rep's raw mid-call note into a phrase that will populate variable {{${body.name}}} in a Samwise call script. The rep reads the script aloud right now — your output's job is to be the right thing to SAY in this specific call.
+
+WHAT THIS VARIABLE CAPTURES:
+${semantics}
+
+${contextBlock}
+${otherBlock}
+RAW REP NOTE:
+"""
+${body.rawValue}
+"""
+
+RULES:
+- SYNTHESIZE — DO NOT PARAPHRASE. The rep's raw note is a brain dump: long, redundant, conflated, mid-thought. Your job is to extract the tightest noun or verb phrase that fits ALL the script slots above and drop everything else. If the raw note is 30 words and the slot calls for a 4-word phrase, return 4 words. The slot-fit test is the size budget — your output must read cleanly when the rep says the slot sentence aloud, with no padding or rewinds. A paraphrase that is roughly the same length as the raw note is a FAILURE.
+- Extract ONLY content relevant to THIS variable. The rep's note may conflate multiple variables — strip anything that belongs elsewhere. Example: if the rep mixes the behaviour, biographical context, and the life-stakes reason, and this variable is core_motivation, output only the life-stakes reason.
+- Preserve the prospect's voice and their chosen framing. Tightening the phrase is REQUIRED; replacing the prospect's specific words with a generic clinical noun is NOT. If the prospect said "salir con mujeres mediocres", output "salir con mujeres mediocres" — NEVER collapse to "incumplimiento" or "conformismo". If the prospect described their problem as "mi enemigo", "the bleeding", "my disease", "la enfermedad", keep that detachment metaphor verbatim. NEVER substitute clinical terms ("addiction", "depression", "anxiety", "ADHD") into the output. You may reason clinically internally; the output protects the prospect's chosen framing because the rep reads it aloud to them.
+- Use the OTHER VARIABLES block above ONLY to disambiguate ambiguous wording in the rep's note (e.g. "defaulting" — financial breach? settling-for-default option?). NEVER pull content from other variables into your output; that content belongs to those other variables.
+- If the raw note does not contain content for THIS variable (the rep typed into the wrong field), return the raw note unchanged. NEVER fabricate. NEVER infer from other variables.
+- Return ONLY the cleaned phrase. No labels, no JSON, no commentary, no surrounding quotes.
+
+CLEANED PHRASE:`;
+}
+/* eslint-enable max-len */
+
+/**
+ * cleanVariable (HTTP)
+ *
+ * Body: { name, rawValue, frameworkSemantics?, scriptContexts? }
+ * Response: { cleaned }
+ *
+ * Script-context-aware cleaning. The rep's raw mid-call note is shaped
+ * into a phrase that fits the actual script slots where this variable
+ * appears. Stateless. Falls back to returning rawValue unchanged on any
+ * error so the frontend never blocks the rep on a failed cleaning call.
+ */
+export const cleanVariable = onRequest({cors: true}, async (req, res) => {
+  interface CleanVariableBody {
+    name: string;
+    rawValue: string;
+    frameworkSemantics?: string;
+    scriptContexts?: string[];
+    // Other captured variables for cross-context disambiguation. The
+    // cleaner uses these to resolve ambiguity in the rep's raw note
+    // (e.g. "defaulting" — financial breach? settling-for-default
+    // option?) but does NOT pull content from them into the output.
+    otherVariables?: Record<string, string>;
+  }
+
+  let rawValue = "";
+  try {
+    const body = req.body as CleanVariableBody;
+    rawValue = body.rawValue ?? "";
+    if (!rawValue.trim()) {
+      res.status(200).json({cleaned: ""});
+      return;
+    }
+
+    const prompt = buildCleanVariablePrompt(body);
+    const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+    const model = gemini.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      generationConfig: {temperature: 0.2},
+    });
+    const result = await model.generateContent(prompt);
+    const cleaned = result.response.text().trim();
+
+    // Trim wrapping quotes if Gemini decided to wrap the output.
+    const stripped = cleaned.replace(/^["'`]|["'`]$/g, "").trim();
+    res.status(200).json({cleaned: stripped || rawValue});
+  } catch (err) {
+    logger.error("cleanVariable failed", err);
+    res.status(200).json({cleaned: rawValue});
+  }
+});
+
+/**
+ * appendDemoCallRow (HTTP)
+ *
+ * Body: { raw, cleaned, qualificationProspectKey? }
+ * Response: { ok: true, docId: string, prospectKey: string }
+ *
+ * Persists a completed Demo Call to the `demoCalls` Firestore
+ * collection. Doc ID: `${prospectKey}-${Date.now()}` (mirrors the
+ * submitQualification pattern). prospectKey prefers the body's
+ * `qualificationProspectKey` (forwarded by the frontend when a
+ * qualification was loaded into the session) to preserve linkage
+ * between the qualifications + demoCalls collections; falls back to
+ * deriving from cleaned.prospect_name using the same normalization
+ * submitQualification uses (lowercase, non-alphanum → hyphen, trim
+ * hyphens).
+ *
+ * Note: the function name is legacy from a sheet-based version. It no
+ * longer appends a row; it writes a Firestore doc. Frontend URL
+ * constant is unchanged.
+ */
+export const appendDemoCallRow = onRequest(
+  {cors: true},
+  async (req, res) => {
+    interface SaveBody {
+      raw: Record<string, string>;
+      cleaned: Record<string, string>;
+      // Optional: forwarded from the frontend when the rep loaded a
+      // qualification doc into this session. Preserves prospectKey
+      // continuity between qualifications + demoCalls collections.
+      qualificationProspectKey?: string;
+    }
+
+    try {
+      const body = req.body as SaveBody;
+      if (!body || typeof body !== "object" || !body.cleaned) {
+        res.status(400).json({error: "cleaned required"});
+        return;
+      }
+
+      const cleaned = body.cleaned;
+      const raw = body.raw ?? {};
+      const prospectName = (cleaned.prospect_name ?? "").trim();
+      if (!prospectName && !body.qualificationProspectKey) {
+        res.status(400).json({
+          error: "prospect_name or qualificationProspectKey required",
+        });
+        return;
+      }
+
+      const prospectKey = body.qualificationProspectKey ||
+        prospectName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/(^-|-$)/g, "");
+
+      const db = getFirestore();
+      const docId = `${prospectKey}-${Date.now()}`;
+      await db.collection("demoCalls").doc(docId).set({
+        raw,
+        cleaned,
+        prospectKey,
+        repName: cleaned.rep_name ?? "",
+        outcome: cleaned.outcome ?? "",
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      res.status(200).json({ok: true, docId, prospectKey});
+      return;
+    } catch (err) {
+      logger.error("appendDemoCallRow failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+      return;
+    }
+  }
+);
+
+// =============================================================================
+// Qualification Agent (web first-touch Fit Assessment)
+// =============================================================================
+// Two functions back the qualification agent that lives at
+// samwise-landing/app/qualify:
+//
+//   - submitQualification: receives the payload from the agent's
+//     submit-tool (voice or text), evaluates the rubric server-side
+//     (qualified / disqualified), and writes a doc
+//     to the `qualifications` collection.
+//
+//   - loadQualification: reads the latest qualification doc by a
+//     prospect identifier (phone, email, or name). Consumed by
+//     samwise-app/app/copilot when the rep starts a demo call.
+//
+// Rubric (mirrors the Fit Assessment Call Google Doc
+// id=1pcE3Y7BZB_xUBFHK3der_CEvgaKazHZabV2utFZfCKM):
+//   Priority 1 gates (all three must pass to qualify):
+//     - decision_taken === "Y"
+//     - behaviour_clarity === "clear"
+//     - motivation_clarity === "clear"
+// =============================================================================
+
+/**
+ * submitQualification (HTTP, CORS-enabled)
+ *
+ * Body: full QualificationPayload (see samwise-landing/lib/qualify/schema.ts).
+ * Response: { ok: true, docId, outcome, prospectKey }
+ *
+ * Evaluates the rubric server-side. Always writes the doc, even for
+ * disqualified or safety-flagged sessions — we want the data either way.
+ */
+export const submitQualification = onRequest(
+  {cors: true},
+  async (req, res) => {
+    interface SubmitQualificationBody {
+      // identifiers
+      prospect_name: string;
+      contact_email?: string;
+      contact_phone?: string;
+      language: "es" | "en";
+
+      // Priority 1 — disqualification gates
+      decision_taken: "Y" | "N";
+      behaviour_clarity: "clear" | "vague";
+      motivation_clarity: "clear" | "vague";
+
+      // Priority 2 — captured iff Priority 1 passes (else absent)
+      behaviour_to_change?: string;
+      core_motivation?: string;
+      problem_duration_self_reported?: string;
+      life_stage_context?: string;
+      symbolic_anchor_type?:
+        | "religious"
+        | "philosophical"
+        | "esoteric"
+        | "hyper-rational"
+        | "none";
+      symbolic_anchor_description?: string;
+      alternatives_tried?: string;
+      why_alternatives_failed?: string;
+      alternatives_exhaustion_level?: "low" | "medium" | "high";
+    }
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+
+      const payload = req.body as SubmitQualificationBody;
+
+      if (!payload.prospect_name || !payload.language) {
+        res.status(400).json({error: "prospect_name and language required"});
+        return;
+      }
+
+      const qualified =
+        payload.decision_taken === "Y" &&
+        payload.behaviour_clarity === "clear" &&
+        payload.motivation_clarity === "clear";
+
+      const outcome: "qualified" | "disqualified" =
+        qualified ? "qualified" : "disqualified";
+
+      const identityRaw =
+        payload.contact_phone ||
+        payload.contact_email ||
+        payload.prospect_name;
+
+      const prospectKey = identityRaw
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+
+      const db = getFirestore();
+      const docId = `${prospectKey}-${Date.now()}`;
+      await db.collection("qualifications").doc(docId).set({
+        ...payload,
+        outcome,
+        qualified,
+        prospectKey,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      res.status(200).json({ok: true, docId, outcome, prospectKey});
+    } catch (err) {
+      logger.error("submitQualification failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);
+
+/**
+ * loadQualification (HTTP, CORS-enabled)
+ *
+ * Body: { identifier: string }  — phone, email, or prospect name.
+ * Response:
+ *   { ok: true, qualification: <doc data> }
+ *   { ok: false, reason: "not_found" }
+ *
+ * Returns the most recent qualification doc whose prospectKey matches
+ * the normalized identifier. Consumed by samwise-app/app/copilot to
+ * pre-fill demo-call variables.
+ *
+ * Note: requires a composite index on (prospectKey ASC, createdAt DESC)
+ * in the `qualifications` collection. Firestore returns an
+ * index-creation link in the error message on the first call.
+ */
+export const loadQualification = onRequest(
+  {cors: true},
+  async (req, res) => {
+    interface LoadQualificationBody {
+      identifier: string;
+    }
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+
+      const {identifier} = req.body as LoadQualificationBody;
+      if (!identifier || typeof identifier !== "string") {
+        res.status(400).json({error: "identifier required"});
+        return;
+      }
+
+      const normalized = identifier
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+
+      const db = getFirestore();
+      const snap = await db
+        .collection("qualifications")
+        .where("prospectKey", "==", normalized)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+
+      if (snap.empty) {
+        res.status(200).json({ok: false, reason: "not_found"});
+        return;
+      }
+
+      res.status(200).json({ok: true, qualification: snap.docs[0].data()});
+    } catch (err) {
+      logger.error("loadQualification failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);

@@ -2,7 +2,7 @@
   "name": "functions",
   "scripts": {
     "lint": "eslint --ext .js,.ts .",
-    "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/",
+    "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/ && cp src/load_call_script_prompt.txt lib/",
     "build:watch": "tsc --watch",
     "serve": "npm run build && firebase emulators:start --only functions",
     "shell": "npm run build && firebase functions:shell",

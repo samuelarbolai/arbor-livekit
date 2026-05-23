@@ -7,7 +7,7 @@ import {
 } from '@livekit/agents';
 import dotenv from 'dotenv';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Agent } from './agent';
+import { Agent } from './flows/call/agent';
 
 dotenv.config({ path: '.env.local' });
 

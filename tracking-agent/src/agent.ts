@@ -91,7 +91,7 @@ export class Agent extends voice.Agent {
         recordAnsweredCall: llm.tool({
           description: dedent`
             Call as soon as the user has given a clear yes/no on whether they
-            answered the morning coaching call for the named ritual today.
+            answered the coaching call for the named ritual today.
             Pass true for yes, false for no. The googleDocId parameter must
             be the ID of the ritual you are currently asking about.
           `,
@@ -169,6 +169,17 @@ function buildInstructions(language: string, rituals: RitualEntry[]): string {
     })
     .join('\n');
 
+  // Agree number with rituals.length so a single-ritual user doesn't
+  // hear a clunky plural in the framing line and the multi-ritual case
+  // still reads naturally.
+  const isSingular = rituals.length === 1;
+  const environmentLine = isSingular
+    ? 'The user has one behaviour they want to change.'
+    : `The user has ${rituals.length} behaviours they want to change.`;
+  const walkThroughLine = isSingular
+    ? 'Walk through the behaviour the user wants to change:'
+    : 'Walk through the behaviours the user wants to change, in order:';
+
   return dedent`
     <personality>
       Brief tracking check-in agent over the phone, NOT a coach. Warm,
@@ -176,9 +187,9 @@ function buildInstructions(language: string, rituals: RitualEntry[]): string {
     </personality>
 
     <environment>
-      You speak with the user over voice in ${language}. The user has one
-      or more active behaviours they are tracking. Your job is to gather
-      three KPIs per behaviour and end the call as quickly as possible.
+      You speak with the user over voice in ${language}. ${environmentLine}
+      Your job is to gather three KPIs per behaviour and end the call as
+      quickly as possible.
     </environment>
 
     <tone and style>
@@ -193,14 +204,14 @@ function buildInstructions(language: string, rituals: RitualEntry[]): string {
     </tone and style>
 
     <behaviours>
-      Walk through these behaviours in order:
+      ${walkThroughLine}
 ${behaviourList}
 
       For each behaviour collect three KPIs (the tool names are still
       "ritual"-prefixed for historical reasons):
         - ritualFulfilled — did they perform their ritual today?
         - relapse         — did they have a relapse on the behaviour?
-        - answeredCall    — did they pick up the morning coaching call?
+        - answeredCall    — did they pick up the coaching call for this ritual today?
 
       CONVERSATION SHAPE — follow this exactly:
 
