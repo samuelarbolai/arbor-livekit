@@ -1,27 +1,62 @@
-import { type JobContext, voice } from '@livekit/agents';
+import { type JobContext, llm as agentsLlm, voice } from '@livekit/agents';
 import * as livekit from '@livekit/agents-plugin-livekit';
 import * as silero from '@livekit/agents-plugin-silero';
 import { BackgroundVoiceCancellation } from '@livekit/noise-cancellation-node';
-import { makeLlm, makeStt, makeTts } from '../../config/providers';
+import { RoomEvent } from '@livekit/rtc-node';
+import {
+  UNFILTERED_SAFETY_SETTINGS,
+  makeQualificationLlm,
+  makeStt,
+  makeTts,
+} from '../../config/providers';
+import { applyConversationTracing } from '../../config/tracing';
 import { QUALIFICATION_VOICE_ID_BY_LANGUAGE } from '../../config/voiceIds';
 import { type QualificationMeta } from '../../types/metadata';
-import { IntakeAgent } from './intake';
+import { attachIdleShutdown } from '../onboarding/idleHandler';
+import { QualificationAgent } from './agent';
+import { attachStallRecovery } from './stallRecovery';
 
-// Lifecycle:
+const EXTRACT_QUALIFICATION_URL = process.env.EXTRACT_QUALIFICATION_URL;
+
+// Lifecycle (single-agent + agent/scribe split):
 //   1. Worker accepts a dispatch with metadata { flow: 'qualification',
-//      language, persona }.
-//   2. We connect to the room, build the shared AgentSession, and start
-//      with the IntakeAgent.
-//   3. IntakeAgent runs the gates + safety, then calls gateDecision.
-//   4. gateDecision either hands off to CaptureAgent (qualified path) or
-//      submits + publishes outcome (DQ / safety paths).
-//   5. CaptureAgent (qualified path) captures P2 verbatim, calls
-//      submitQualification, publishes outcome, ends.
+//      language, prospect_name, prospect_email? }.
+//   2. We connect to the room, build the AgentSession, and start the
+//      QualificationAgent (one agent for the entire call, one prompt,
+//      two tools: setVariables + endCall).
+//   3. The agent has a thoughtful interview, committing user-verbatim
+//      notes via setVariables. Each setVariables call publishes a
+//      `qualification:variable_update` data event so the frontend's
+//      <VariablesPanel> fills live.
+//   4. Submission triggers — whichever fires first wins:
+//       (a) the agent calls endCall (natural close after its closing line);
+//       (b) the user disconnects from the room;
+//       (c) the idle handler hits IDLE_MS with no activity.
+//      All three route through submitIfNotYet(), which is idempotent on
+//      a per-call `submitted` flag.
+//   5. submitIfNotYet POSTs the transcript to the extractQualification
+//      cloud function. The CF runs an extraction LLM over the transcript
+//      to produce the authoritative QualificationPayload, writes the
+//      qualifications/{prospectKey} doc, and writes a mail/ doc that
+//      triggers the post-call confirmation email.
+//   6. The CF's response carries { outcome, prospectKey, docId }. The
+//      worker publishes a `qualification:outcome` data event so the
+//      frontend swaps to <FinalScreen>. The frontend then disconnects.
 export async function runQualificationFlow(
   ctx: JobContext,
   meta: QualificationMeta,
 ): Promise<void> {
   await ctx.connect();
+
+  // Observability (Phase 1): route this call's span tree to Langfuse, tagged
+  // with the conversation contract — session id = room name, flow, language.
+  // promptVariant + synthetic default ("default"/false) until Phase 5 wires the
+  // load-test seam. See samwise-backend/observability/.
+  applyConversationTracing({
+    flow: 'qualification',
+    language: meta.language,
+    sessionId: ctx.room.name ?? ctx.job.id, // room.name is string | undefined; job.id always present
+  });
 
   const voiceId = QUALIFICATION_VOICE_ID_BY_LANGUAGE[meta.language];
 
@@ -36,15 +71,22 @@ export async function runQualificationFlow(
   // understood matters more than reacting fast.
   const session = new voice.AgentSession({
     stt: makeStt(meta.language),
-    llm: makeLlm(),
+    llm: makeQualificationLlm(UNFILTERED_SAFETY_SETTINGS),
     tts: makeTts(meta.language, voiceId),
     turnDetection: new livekit.turnDetector.MultilingualModel(),
     vad: ctx.proc.userData.vad! as silero.VAD,
+    // EXPLICITLY false — load-bearing. AgentSessionOptions defaults
+    // preemptiveGeneration to TRUE in @livekit/agents 1.2.0, so OMITTING this field
+    // does NOT yield "off": until 2026-05-31 this flow was silently running with it
+    // ON, exactly the fragment-leak behavior the comment above warns against. The
+    // top-level field is the correct surface (the deprecated `voiceOptions` wrapper
+    // is flattened onto AgentSessionOptions).
+    preemptiveGeneration: false,
   });
 
-  // Lifecycle state — tracked across the Intake → Capture handoff.
-  // (userTurnCount is declared further down in the watchdog block so the
-  // watchdog can use it as a gate.)
+  // Lifecycle state — tracked across the whole call. (userTurnCount is
+  // declared further down in the watchdog block so the watchdog can use
+  // it as a gate.)
   let outcome: 'qualified' | 'disqualified' | 'abandoned' = 'abandoned';
 
   // Verbal filler. If the LLM stays in `thinking` for more than the threshold,
@@ -67,7 +109,11 @@ export async function runQualificationFlow(
     if (ev.newState === 'thinking') {
       thinkingTimer = setTimeout(() => {
         thinkingTimer = null;
-        try { session.say(FILLER_TEXT, { addToChatCtx: false }); } catch { /* ignore */ }
+        try {
+          session.say(FILLER_TEXT, { addToChatCtx: false });
+        } catch {
+          /* ignore */
+        }
       }, FILLER_THRESHOLD_MS);
     } else if (thinkingTimer) {
       clearTimeout(thinkingTimer);
@@ -99,7 +145,7 @@ export async function runQualificationFlow(
 
   const CONFIDENCE_WINDOW_SIZE = 3;
   const POOR_AUDIO_ENTER_THRESHOLD = 0.65; // avg below this → flag bad audio
-  const POOR_AUDIO_EXIT_THRESHOLD = 0.80;  // avg above this → clear flag
+  const POOR_AUDIO_EXIT_THRESHOLD = 0.8; // avg above this → clear flag
   const IDLE_WATCHDOG_MS = 8_000;
   const IDLE_WATCHDOG_REFRACTORY_MS = 30_000;
 
@@ -201,6 +247,33 @@ export async function runQualificationFlow(
     }
   });
 
+  // ─── Empty-completion / stall recovery ─────────────────────────────────────
+  // gemini-2.5-flash occasionally returns an empty completion on this flow's
+  // sensitive content; the google plugin retries it to exhaustion and the turn
+  // fails with no speech, leaving the caller in silence (observed: 40+ s of dead
+  // air until hangup). The UNFILTERED_SAFETY_SETTINGS above make this rare; this
+  // is the net that recovers when it still happens. On a failed or stalled
+  // generation we say a short re-prompt — which breaks the silence AND resets the
+  // session's unrecoverable-error counter (it resets whenever the agent speaks),
+  // so the session never accumulates its way to an error-close.
+  const RECOVERY_TEXT =
+    meta.language === 'es'
+      ? 'Perdona, se me cruzó la línea un momento. ¿Me lo repites, por favor?'
+      : 'Sorry, my line glitched for a second — could you say that again?';
+  const disposeStallRecovery = attachStallRecovery(session, {
+    onRecover: (reason) => {
+      console.warn('[qualification] recovering from stalled generation', { reason });
+      try {
+        session.say(RECOVERY_TEXT, { addToChatCtx: false });
+      } catch {
+        /* race with shutdown — ignore */
+      }
+    },
+  });
+  ctx.addShutdownCallback(async () => {
+    disposeStallRecovery();
+  });
+
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
     if (ev.item.type !== 'message') return;
     if (ev.item.role === 'user') {
@@ -224,10 +297,7 @@ export async function runQualificationFlow(
           // Don't interrupt here — the user just spoke and the LLM is about
           // to auto-reply. Let the next turn (or the watchdog) handle the
           // mic-check. The poorAudio flag will steer both.
-        } else if (
-          poorAudioActive &&
-          avg > POOR_AUDIO_EXIT_THRESHOLD
-        ) {
+        } else if (poorAudioActive && avg > POOR_AUDIO_EXIT_THRESHOLD) {
           poorAudioActive = false;
           console.log('[qualification audio-quality] exiting poorAudio', { avg });
         }
@@ -235,25 +305,128 @@ export async function runQualificationFlow(
     }
   });
 
-  // Sniff outcome events published by the tools so the shutdown log knows
-  // why the call ended. (The same events are consumed by the frontend.)
-  ctx.room.on('dataReceived', (payload, participant) => {
-    if (participant?.identity !== ctx.room.localParticipant?.identity) return;
-    try {
-      const msg = JSON.parse(new TextDecoder().decode(payload)) as {
-        type?: string;
-        outcome?: string;
-      };
-      if (
-        msg.type === 'qualification:outcome' &&
-        (msg.outcome === 'qualified' ||
-          msg.outcome === 'disqualified')
-      ) {
-        outcome = msg.outcome;
-      }
-    } catch {
-      // ignore non-JSON
+  // ─── Submission path ──────────────────────────────────────────────────────
+  // The agent reference is captured in a local so submitIfNotYet can read
+  // its chatCtx for the transcript. Assigned at session.start below.
+  let agent: QualificationAgent | null = null;
+  let submitted = false;
+
+  // Convert the agent's chat history into a transcript the extraction
+  // cloud function can consume. Only user + assistant text messages —
+  // skip the system prompt and any tool-call / tool-result entries.
+  function buildTranscript(
+    chatCtx: agentsLlm.ChatContext,
+  ): Array<{ role: 'user' | 'assistant'; content: string }> {
+    const turns: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    for (const item of chatCtx.items) {
+      if (item.type !== 'message') continue;
+      if (item.role !== 'user' && item.role !== 'assistant') continue;
+      const content = item.textContent;
+      if (!content) continue;
+      turns.push({ role: item.role, content });
     }
+    return turns;
+  }
+
+  async function submitIfNotYet(
+    reason: 'endCall' | 'disconnect' | 'idle_timeout' | 'hard_cap',
+  ): Promise<void> {
+    if (submitted) return;
+    submitted = true;
+
+    if (!agent) {
+      console.warn('[qualification] submitIfNotYet fired before agent ready', { reason });
+      return;
+    }
+
+    const transcript = buildTranscript(agent.chatCtx);
+    console.log('[qualification] submitting', {
+      reason,
+      transcriptTurns: transcript.length,
+      userTurnCount,
+    });
+
+    // Tell the frontend extraction is in progress — it swaps the mic for
+    // the "Almost there — pulling up your link." indicator and disables
+    // PTT so the user doesn't talk into a closing call. Only fired on
+    // the endCall path; on disconnect / idle_timeout / hard_cap the user
+    // is already gone (or about to be) and there's nothing to render.
+    if (reason === 'endCall') {
+      try {
+        await ctx.room.localParticipant?.publishData(
+          new TextEncoder().encode(JSON.stringify({ type: 'qualification:finalizing' })),
+          { reliable: true },
+        );
+      } catch (err) {
+        console.warn('[qualification] finalizing publishData failed', err);
+      }
+    }
+
+    if (!EXTRACT_QUALIFICATION_URL) {
+      console.warn(
+        '[qualification] EXTRACT_QUALIFICATION_URL not set — skipping submission (A4 wires the CF)',
+      );
+      return;
+    }
+
+    try {
+      const resp = await fetch(EXTRACT_QUALIFICATION_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript,
+          prospect_name: meta.prospect_name,
+          prospect_email: meta.prospect_email,
+          language: meta.language,
+        }),
+      });
+      if (!resp.ok) {
+        console.error('[qualification] extractQualification returned non-OK', {
+          status: resp.status,
+          statusText: resp.statusText,
+        });
+        return;
+      }
+      const data = (await resp.json()) as {
+        ok: boolean;
+        outcome: 'qualified' | 'disqualified';
+        docId: string;
+        prospectKey: string;
+      };
+      outcome = data.outcome;
+
+      // Publish the outcome so the landing swaps to <FinalScreen>. Skipped
+      // on the disconnect path because the frontend is already gone — the
+      // outcome lives in Firestore and the email goes out regardless.
+      if (reason !== 'disconnect') {
+        try {
+          await ctx.room.localParticipant?.publishData(
+            new TextEncoder().encode(
+              JSON.stringify({ type: 'qualification:outcome', outcome: data.outcome }),
+            ),
+            { reliable: true },
+          );
+        } catch (err) {
+          console.warn('[qualification] outcome publishData failed', err);
+        }
+      }
+    } catch (err) {
+      console.error('[qualification] submission failed', err);
+      // Don't unset `submitted` — the call is already winding down; a retry
+      // mid-shutdown would just race the worker exit. The CF is idempotent
+      // on prospectKey so a future re-submission (e.g. cron retry) is safe.
+    }
+  }
+
+  // Disconnect-flush: if the user closes the tab without the agent reaching
+  // endCall, fire submission with whatever transcript we have. Ignore
+  // disconnects of the local (agent) participant — only react to remote.
+  ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+    if (participant.identity === ctx.room.localParticipant?.identity) return;
+    console.log('[qualification] participant disconnected', { identity: participant.identity });
+    submitIfNotYet('disconnect').catch((err) => {
+      console.error('[qualification] disconnect submission error', err);
+    });
   });
 
   ctx.addShutdownCallback(async () => {
@@ -267,8 +440,55 @@ export async function runQualificationFlow(
     });
   });
 
+  agent = new QualificationAgent(meta, ctx, {
+    onEndCall: () => {
+      submitIfNotYet('endCall').catch((err) => {
+        console.error('[qualification] endCall submission error', err);
+      });
+    },
+  });
+
+  // Hard idle shutdown (canonical per the samwise-livekit-agents skill —
+  // web flows can sit forever without phone-call boundaries). 10 min of no
+  // ConversationItemAdded events → ctx.shutdown('idle_timeout'). We do NOT
+  // also fire submitIfNotYet here because the shutdown will cause
+  // participantDisconnected, which already routes to submitIfNotYet.
+  attachIdleShutdown(ctx, session);
+
+  // Wall-clock hard cap on session duration. Belt-and-suspenders to the
+  // idle handler above — that one resets on ANY ConversationItemAdded
+  // event, which an open mic in a noisy room will keep tripping with
+  // low-confidence ambient transcripts. Without an absolute cap, observed
+  // sessions ran 196 minutes on the LiveKit dashboard (real cost).
+  // 25 min is well past any legitimate qualify call (real ones land in
+  // 8–15 min). When this fires we route through submitIfNotYet('hard_cap')
+  // so the existing flow takes over: transcript is extracted, outcome is
+  // computed, `qualification:outcome` data event is published to the
+  // room, and the landing's <FinalScreen> swap kicks in — bringing the
+  // user (if still present) to the booking CTA. We then `ctx.shutdown`
+  // so the LiveKit room tears down promptly and billing stops.
+  const HARD_MAX_SESSION_MS = 25 * 60 * 1000;
+  const hardCapTimer = setTimeout(() => {
+    console.warn('[qualification] hard session cap reached, forcing shutdown', {
+      durationMs: HARD_MAX_SESSION_MS,
+      userTurnCount,
+      submitted,
+    });
+    submitIfNotYet('hard_cap')
+      .catch((err) => console.error('[qualification] hard_cap submission error', err))
+      .finally(() => {
+        // Give the outcome data event a moment to reach the browser so
+        // <FinalScreen> swaps before the room tears down. Even on slow
+        // links 3s is plenty for one reliable data message.
+        setTimeout(() => ctx.shutdown('hard_cap'), 3_000);
+      });
+  }, HARD_MAX_SESSION_MS);
+  ctx.addShutdownCallback(async () => {
+    clearTimeout(hardCapTimer);
+  });
+
   await session.start({
-    agent: new IntakeAgent(meta, ctx),
+    agent,
     room: ctx.room,
     inputOptions: {
       // Web (WebRTC) flow — keep the LiveKit Cloud noise cancellation default.

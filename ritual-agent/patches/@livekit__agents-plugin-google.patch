@@ -1,0 +1,91 @@
+diff --git a/dist/llm.d.cts b/dist/llm.d.cts
+index 54104e6e6d70fcec5b61bca6739e574afeb961c4..8a1998f88c5a1649f77f58aeca2e4ff2bfd11d2d 100644
+--- a/dist/llm.d.cts
++++ b/dist/llm.d.cts
+@@ -22,6 +22,7 @@ export interface LLMOptions {
+     geminiTools?: LLMTools;
+     httpOptions?: types.HttpOptions;
+     seed?: number;
++    safetySettings?: types.SafetySetting[];
+ }
+ export declare class LLM extends llm.LLM {
+     #private;
+@@ -56,7 +57,7 @@ export declare class LLM extends llm.LLM {
+      * @param httpOptions - The HTTP options to use for the session.
+      * @param seed - Random seed for reproducible results. Defaults to undefined.
+      */
+-    constructor({ model, apiKey, vertexai, project, location, temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, toolChoice, thinkingConfig, automaticFunctionCallingConfig, geminiTools, httpOptions, seed, }?: LLMOptions);
++    constructor({ model, apiKey, vertexai, project, location, temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, toolChoice, thinkingConfig, automaticFunctionCallingConfig, geminiTools, httpOptions, seed, safetySettings, }?: LLMOptions);
+     chat({ chatCtx, toolCtx, connOptions, toolChoice, extraKwargs, geminiTools, }: {
+         chatCtx: llm.ChatContext;
+         toolCtx?: llm.ToolContext;
+diff --git a/dist/llm.d.ts b/dist/llm.d.ts
+index 54104e6e6d70fcec5b61bca6739e574afeb961c4..8a1998f88c5a1649f77f58aeca2e4ff2bfd11d2d 100644
+--- a/dist/llm.d.ts
++++ b/dist/llm.d.ts
+@@ -22,6 +22,7 @@ export interface LLMOptions {
+     geminiTools?: LLMTools;
+     httpOptions?: types.HttpOptions;
+     seed?: number;
++    safetySettings?: types.SafetySetting[];
+ }
+ export declare class LLM extends llm.LLM {
+     #private;
+@@ -56,7 +57,7 @@ export declare class LLM extends llm.LLM {
+      * @param httpOptions - The HTTP options to use for the session.
+      * @param seed - Random seed for reproducible results. Defaults to undefined.
+      */
+-    constructor({ model, apiKey, vertexai, project, location, temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, toolChoice, thinkingConfig, automaticFunctionCallingConfig, geminiTools, httpOptions, seed, }?: LLMOptions);
++    constructor({ model, apiKey, vertexai, project, location, temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, toolChoice, thinkingConfig, automaticFunctionCallingConfig, geminiTools, httpOptions, seed, safetySettings, }?: LLMOptions);
+     chat({ chatCtx, toolCtx, connOptions, toolChoice, extraKwargs, geminiTools, }: {
+         chatCtx: llm.ChatContext;
+         toolCtx?: llm.ToolContext;
+diff --git a/dist/llm.js b/dist/llm.js
+index 818c0287ba883a330d68cf0e47097fd263bfce42..c9aef9b0de507f5a6066ae324e604e8cc6b9360c 100644
+--- a/dist/llm.js
++++ b/dist/llm.js
+@@ -67,7 +67,8 @@ class LLM extends llm.LLM {
+     automaticFunctionCallingConfig,
+     geminiTools,
+     httpOptions,
+-    seed
++    seed,
++    safetySettings
+   } = {
+     model: "gemini-2.0-flash-001"
+   }) {
+@@ -123,7 +124,8 @@ class LLM extends llm.LLM {
+       geminiTools,
+       httpOptions,
+       seed,
+-      apiKey
++      apiKey,
++      safetySettings
+     };
+   }
+   chat({
+@@ -194,6 +196,9 @@ class LLM extends llm.LLM {
+     if (this.#opts.thinkingConfig !== void 0) {
+       extras.thinkingConfig = this.#opts.thinkingConfig;
+     }
++    if (this.#opts.safetySettings !== void 0) {
++      extras.safetySettings = this.#opts.safetySettings;
++    }
+     if (this.#opts.automaticFunctionCallingConfig !== void 0) {
+       extras.automaticFunctionCalling = this.#opts.automaticFunctionCallingConfig;
+     }
+@@ -379,6 +384,14 @@ class LLMStream extends llm.LLMStream {
+     }
+   }
+   #parsePart(id, part) {
++    // Drop Gemini thought-summary parts so they never reach TTS even
++    // if Google flips the includeThoughts default (or a future SDK
++    // change leaks them). Belt-and-suspenders to the includeThoughts:
++    // false config passed by callers. Observed 2026-05-27 leaking
++    // English chain-of-thought into Spanish calls.
++    if (part.thought) {
++      return null;
++    }
+     if (part.functionCall) {
+       return {
+         id,

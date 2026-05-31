@@ -25,8 +25,12 @@ FROM base AS build
 # And set it as the working directory
 WORKDIR /app
 
-# Copy just the dependency files first, for more efficient layer caching
-COPY package.json pnpm-lock.yaml ./
+# Copy just the dependency files first, for more efficient layer caching.
+# pnpm-workspace.yaml + patches/ are required because patchedDependencies
+# (added 2026-05-27 for the Gemini thought-leak fix) lives in the
+# workspace config in pnpm 10 — without it, --frozen-lockfile fails.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
 
 # Install dependencies using pnpm
 # --frozen-lockfile ensures we use exact versions from pnpm-lock.yaml for reproducible builds

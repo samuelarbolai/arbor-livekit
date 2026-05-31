@@ -21,7 +21,8 @@ WORKDIR /app
 ARG CACHE_BUST=4
 RUN echo "Cache bust: $CACHE_BUST"
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 
 COPY . .

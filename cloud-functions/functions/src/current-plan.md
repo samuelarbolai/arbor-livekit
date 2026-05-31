@@ -1,134 +1,316 @@
-# current-plan.md — Improve the copilot, backend side (cleanVariable synthesis)
+# current-plan.md — Replace loadCallScript's Gemini call with a deterministic parser
 
 ## Plan Summary
 
-One bug, one file, one function. The `cleanVariable` cloud function (defined in `index.ts`) builds its Gemini prompt via the helper `buildCleanVariablePrompt`. One rule in that helper's RULES block — *"Preserve the prospect's specific framing. Do NOT collapse a vivid concrete description into a generic abstract noun"* — fires too hard. Gemini reads it as "leave the rep's wording roughly as-is," so the `Cleaned:` output is a paraphrase of the raw note rather than the tight slot-fit phrase the script needs.
+`loadCallScript` currently sends the flattened Demo Doc text to `gemini-2.5-flash` for parsing into `{ scriptType, phases }`. The prompt itself instructs Gemini to use `[SAY]/[/SAY]` markers DETERMINISTICALLY — i.e. as exact text tokens. That means Gemini is doing no real reasoning anymore; it's a regex job dressed up as an LLM call. The cost is 5–15s of latency per script load (sometimes more), a 120s timeout exposure, and a non-deterministic dependency.
 
-The user's complaint, verbatim: *"the cleaned version is actually just a better written version of the same input. That means I am not getting the value of a cleaned variable, which is to have it synthesize, from a brain dump, so I can use it in the context of the script right away."*
+This plan rips out the Gemini call and replaces it with a pure TypeScript `parseScript(title, content)` function. Output JSON shape is byte-identical to today's — frontend, localStorage v2 sessions, and the script-pane renderer require no changes.
 
-**Fix:** swap the offending rule. The new RULES block explicitly tells Gemini to SYNTHESIZE to the shortest phrase that fits all script slots, while still protecting (a) the prospect's voice, (b) their detachment metaphor, and (c) verbatim-quote variables. The slot-context block already in the prompt (`SCRIPT SLOTS where {{var}} appears`) is the grammatical anchor — Gemini picks the form that fits.
-
-Sister plan at `samwise-app/current-plan.md` covers the stale-state-bleed bug in the frontend. This sub-plan covers ONLY the prompt edit.
+The canonical Demo Doc (`1sBHuGaXCFaP8cmQdUgNpoQYwCq3L4-OfDMDoPR73a5g`) already starts with a literal `[TYPE: demo]` line, so scriptType detection is exact (with a keyword fallback for older Docs that lack the marker).
 
 ## Plan Architecture (Flow)
 
-1. Frontend posts `{ name, rawValue, frameworkSemantics, scriptContexts, otherVariables }` to `cleanvariable-b6fhjlgejq-uc.a.run.app`. **Unchanged.**
-2. `cleanVariable` (HTTP handler) calls `buildCleanVariablePrompt(body)`. **Unchanged.**
-3. `buildCleanVariablePrompt` returns the prompt string. **RULES block edited.**
-4. Gemini Flash returns the cleaned phrase. **Unchanged.**
-5. Handler strips wrapping quotes and returns `{ cleaned }`. **Unchanged.**
+1. Frontend POSTs `{ googleDocLink }` to `loadcallscript-…cloudfunctions.net`. **Unchanged.**
+2. `loadCallScript` extracts the Doc ID, calls Docs API → returns `doc.data`. **Unchanged.**
+3. `loadCallScript` calls `flattenDocToText(doc.data.body?.content ?? [])` → flat text. **Unchanged.**
+4. `loadCallScript` calls `parseScript(title, content)` → `{ scriptType, phases }`. **NEW** (replaces Gemini round-trip).
+5. Handler returns `res.status(200).json(parsed)`. **Unchanged.**
 
-No contract change, no new function, no new env var.
+The Gemini call, the `LOAD_SCRIPT_PROMPT` constant, the `load_call_script_prompt.txt` file, the prompt-fill template-replace, the JSON.parse-of-Gemini-response branch, and the `timeoutSeconds: 120` override all disappear.
 
 ## Plan Structure (Directories and files)
 
 ```
-samwise-backend/cloud-functions/functions/src/
-└── index.ts            # MODIFIED: buildCleanVariablePrompt RULES block
+samwise-backend/cloud-functions/functions/
+├── package.json                                # MODIFIED: drop load_call_script_prompt.txt from build cp
+└── src/
+    ├── index.ts                                # MODIFIED: add parseScript(); rewire loadCallScript;
+    │                                           #           remove LOAD_SCRIPT_PROMPT + fs/path reads
+    ├── load_call_script_prompt.txt             # DELETED
+    ├── context-for-code-agent.md               # MODIFIED: add Recent Changes entry
+    └── current-plan.md                         # THIS FILE
 ```
 
-One file, one block.
+External skill update (outside this module):
+- `/Users/samuelgiraldoconcha/Documents/samwise/.claude/skills/samwise-session-copilot/SKILL.md` — update the `loadCallScript` row in the function table and add a note under "Where things live" about the parser.
 
 ---
 
 ## Modifications (in phases and steps)
 
-### Phase 1 / Step 1 — Replace the RULES block in `buildCleanVariablePrompt`
+### Phase 1 / Step 1 — Add `parseScript` to `index.ts`
 
-- **In-file location:** `samwise-backend/cloud-functions/functions/src/index.ts`, lines 1329–1348 (the template-literal `return` of `buildCleanVariablePrompt`, specifically the `RULES:` section starting after the `RAW REP NOTE:` block).
+- **In-file location:** Insert immediately after `flattenDocToText` (currently ends at line 1231) and BEFORE the `loadCallScript` export (line 1244). Drops in at ~line 1232.
 - **Should not be modified:**
-  - The function signature `function buildCleanVariablePrompt(body: { name, rawValue, frameworkSemantics?, scriptContexts?, otherVariables? }): string` (line 1294).
-  - The `semantics` / `contextBlock` / `otherBlock` builder logic (lines 1301–1327). The slot-context and cross-variable disambiguation are correct; only the RULES section needs to change.
-  - The `WHAT THIS VARIABLE CAPTURES:` / `SCRIPT SLOTS:` / `OTHER VARIABLES:` / `RAW REP NOTE:` headers in the template literal.
-  - The `CLEANED PHRASE:` trailing prompt marker.
-  - The `cleanVariable` HTTP handler itself (lines 1363–1401) — handler logic, env reading, error handling, response shape all stay the same.
-  - The `/* eslint-disable max-len */` / `/* eslint-enable max-len */` pragma pair around the helper.
-- **Code (full replacement of the `return` template literal in `buildCleanVariablePrompt`):**
+  - `flattenDocToText` itself (lines 1209–1231) — keeps doing what it does today.
+  - `extractDocId` (lines 1197–1201).
+  - The `getGoogleAuth` / `getDriveClient` / `getDocsClient` singletons (lines 480–540 region).
+  - Any other function in the file.
+- **Code:**
 
 ```ts
-  return `You are cleaning a rep's raw mid-call note into a phrase that will populate variable {{${body.name}}} in a Samwise call script. The rep reads the script aloud right now — your output's job is to be the right thing to SAY in this specific call.
+/* eslint-disable max-len */
+/**
+ * parseScript — deterministic Doc-text → {scriptType, phases} parser.
+ *
+ * Replaces the Gemini-backed parse in loadCallScript. The Doc uses three
+ * explicit conventions that make this a pure string job:
+ *
+ *   - `[TYPE: demo]` / `[TYPE: onboarding]` / `[TYPE: call_design]` —
+ *     optional standalone line near the top of the Doc. When present, it's
+ *     authoritative. Falls back to title/content keyword matching.
+ *
+ *   - Phase headings — lines matching `Phase N — title` or `Phase N.M — title`
+ *     (em-dash, en-dash, or hyphen accepted). Decimal phases keep their
+ *     string form ("1.5", "8.5"); integer phases emit as `number`.
+ *
+ *   - Pre/Post boundaries — `Pre-call …` / `Precall …` opens a phase with
+ *     `number: "pre-call"`. `After the call …` / `Post-call …` opens
+ *     `number: "post-call"` (note: the Demo Doc places "After the call" in
+ *     the middle of the document — phase order is document order, not
+ *     numeric order).
+ *
+ *   - Body blocks — split deterministically on `[SAY]` / `[/SAY]` text
+ *     tokens. Inside markers → "say" block. Outside → "note" block.
+ *     `[CONDITION: var=value]` lines stay inside note blocks; the frontend
+ *     filters them per-line in script-pane.tsx.
+ *
+ * Anything before the first phase heading is dropped (preamble — Duration,
+ * Goal, Variable syntax, etc.). Trailing non-phase content after the last
+ * phase boundary belongs to that last phase's body (the SAY-state machine
+ * handles it naturally).
+ *
+ * @param {string} title Doc title from docs.documents.get → data.title.
+ * @param {string} content Flattened Doc text from flattenDocToText.
+ * @return {{scriptType: ScriptType, phases: ParsedPhase[]}} Same shape as
+ *   the previous Gemini output.
+ */
+type ScriptType = "demo" | "onboarding" | "call_design" | "unknown";
+type ParsedBlock = { kind: "say" | "note"; text: string };
+type ParsedPhase = {
+  number: number | string;
+  title: string;
+  blocks: ParsedBlock[];
+};
 
-WHAT THIS VARIABLE CAPTURES:
-${semantics}
+const TYPE_MARKER_RE = /\[TYPE:\s*(demo|onboarding|call_design)\s*\]/i;
+const PHASE_RE = /^\s*Phase\s+(\d+(?:\.\d+)?)\s*[—–-]\s*(.+?)\s*$/;
+const PRECALL_RE = /^\s*Pre-?call\b.*$/i;
+const POSTCALL_RE = /^\s*(?:After the call|Post-?call)\b.*$/i;
+// Split on both straight and full-width brackets; Google Docs sometimes
+// autocorrects `[` to `［`. Keep both branches.
+const SAY_SPLIT_RE = /(\[\/?SAY\]|［\/?SAY］)/;
 
-${contextBlock}
-${otherBlock}
-RAW REP NOTE:
-"""
-${body.rawValue}
-"""
+function detectScriptType(title: string, content: string): ScriptType {
+  // Marker takes priority — exact, authoritative.
+  const head = content.slice(0, 500);
+  const m = head.match(TYPE_MARKER_RE) ?? title.match(TYPE_MARKER_RE);
+  if (m) {
+    const v = m[1].toLowerCase();
+    if (v === "demo" || v === "onboarding" || v === "call_design") return v;
+  }
+  // Keyword fallback for Docs without the marker.
+  const haystack = `${title}\n${head}`.toLowerCase();
+  if (/demo call|compatibility & welcome/.test(haystack)) return "demo";
+  if (/dra\.\s*ana\s*mar[ií]a|onboarding/.test(haystack)) return "onboarding";
+  if (/call\s+design|ritual\s+design/.test(haystack)) return "call_design";
+  return "unknown";
+}
 
-RULES:
-- SYNTHESIZE — DO NOT PARAPHRASE. The rep's raw note is a brain dump: long, redundant, conflated, mid-thought. Your job is to extract the tightest noun or verb phrase that fits ALL the script slots above and drop everything else. If the raw note is 30 words and the slot calls for a 4-word phrase, return 4 words. The slot-fit test is the size budget — your output must read cleanly when the rep says the slot sentence aloud, with no padding or rewinds. A paraphrase that is roughly the same length as the raw note is a FAILURE.
-- Extract ONLY content relevant to THIS variable. The rep's note may conflate multiple variables — strip anything that belongs elsewhere. Example: if the rep mixes the behaviour, biographical context, and the life-stakes reason, and this variable is core_motivation, output only the life-stakes reason.
-- Preserve the prospect's voice and their chosen framing. Tightening the phrase is REQUIRED; replacing the prospect's specific words with a generic clinical noun is NOT. If the prospect said "salir con mujeres mediocres", output "salir con mujeres mediocres" — NEVER collapse to "incumplimiento" or "conformismo". If the prospect described their problem as "mi enemigo", "the bleeding", "my disease", "la enfermedad", keep that detachment metaphor verbatim. NEVER substitute clinical terms ("addiction", "depression", "anxiety", "ADHD") into the output. You may reason clinically internally; the output protects the prospect's chosen framing because the rep reads it aloud to them.
-- Use the OTHER VARIABLES block above ONLY to disambiguate ambiguous wording in the rep's note (e.g. "defaulting" — financial breach? settling-for-default option?). NEVER pull content from other variables into your output; that content belongs to those other variables.
-- If the raw note does not contain content for THIS variable (the rep typed into the wrong field), return the raw note unchanged. NEVER fabricate. NEVER infer from other variables.
-- Return ONLY the cleaned phrase. No labels, no JSON, no commentary, no surrounding quotes.
+function splitPhaseBody(body: string): ParsedBlock[] {
+  const blocks: ParsedBlock[] = [];
+  let mode: "say" | "note" = "note";
+  let buf: string[] = [];
+  const flush = () => {
+    const text = buf.join("").trim();
+    if (text) blocks.push({kind: mode, text});
+    buf = [];
+  };
+  for (const part of body.split(SAY_SPLIT_RE)) {
+    if (!part) continue;
+    const norm = part
+      .replace("［", "[")
+      .replace("］", "]");
+    if (norm === "[SAY]") {
+      flush();
+      mode = "say";
+    } else if (norm === "[/SAY]") {
+      flush();
+      mode = "note";
+    } else {
+      buf.push(part);
+    }
+  }
+  flush();
+  // Merge consecutive same-kind blocks (defensive — shouldn't happen from
+  // the state machine alone, but a stray empty [SAY][/SAY] pair could).
+  const merged: ParsedBlock[] = [];
+  for (const b of blocks) {
+    const last = merged[merged.length - 1];
+    if (last && last.kind === b.kind) {
+      last.text = `${last.text}\n${b.text}`.trim();
+    } else {
+      merged.push({...b});
+    }
+  }
+  return merged;
+}
 
-CLEANED PHRASE:`;
+interface PhaseHeading {
+  number: number | string;
+  title: string;
+}
+
+function matchPhaseHeading(line: string): PhaseHeading | null {
+  const m = PHASE_RE.exec(line);
+  if (m) {
+    const numStr = m[1];
+    const number: number | string = numStr.includes(".") ?
+      numStr :
+      parseInt(numStr, 10);
+    return {number, title: m[2].trim()};
+  }
+  if (PRECALL_RE.test(line)) {
+    return {number: "pre-call", title: line.trim()};
+  }
+  if (POSTCALL_RE.test(line)) {
+    return {number: "post-call", title: line.trim()};
+  }
+  return null;
+}
+
+export function parseScript(
+  title: string,
+  content: string,
+): {scriptType: ScriptType; phases: ParsedPhase[]} {
+  const scriptType = detectScriptType(title, content);
+
+  const lines = content.split(/\r?\n/);
+  type Bucket = PhaseHeading & {bodyLines: string[]};
+  const buckets: Bucket[] = [];
+  let current: Bucket | null = null;
+
+  for (const line of lines) {
+    const heading = matchPhaseHeading(line);
+    if (heading) {
+      current = {...heading, bodyLines: []};
+      buckets.push(current);
+    } else if (current) {
+      current.bodyLines.push(line);
+    }
+    // Lines before the first heading are dropped (preamble).
+  }
+
+  const phases: ParsedPhase[] = buckets
+    .map((b) => ({
+      number: b.number,
+      title: b.title,
+      blocks: splitPhaseBody(b.bodyLines.join("\n")),
+    }))
+    .filter((p) => p.blocks.length > 0);
+
+  return {scriptType, phases};
+}
+/* eslint-enable max-len */
 ```
 
 - **Explanation:**
-  - The first rule is the load-bearing change: it names SYNTHESIS as the goal, explicitly rejects paraphrase, and gives Gemini a concrete length test (*"a paraphrase roughly the same length as the raw note is a FAILURE"*). This addresses the user's exact complaint.
-  - The second rule (extract relevant content only) is preserved verbatim from the previous prompt — it's the conflation defense.
-  - The third rule replaces the old *"Preserve the prospect's specific framing. Do NOT collapse a vivid concrete description into a generic abstract noun"* with a sharper version. Both clauses are still there in spirit (voice + metaphor protection, no clinical substitution), but the "DO NOT collapse" half is removed because that's exactly what Gemini was misreading as "DO NOT synthesize." The new phrasing tells Gemini that **tightening is required, what's forbidden is replacing the prospect's words with a generic abstract noun** — which is a much narrower restriction.
-  - The fourth rule (`otherVariables` is for disambiguation only) is preserved verbatim.
-  - The fifth rule is split: previously "If the raw note does not contain content for THIS variable, return the raw note unchanged. NEVER fabricate." The new version adds "NEVER infer from other variables" to seal a gap where Gemini might pull from `otherVariables` content as a fabrication crutch (low likelihood, but cheap to seal).
-  - Sixth rule (output format: just the phrase, no wrappers) is preserved.
+  - **`detectScriptType`** — checks the first 500 chars of content for `[TYPE: ...]`, then the title. Falls back to keyword matching (the same heuristic the Gemini prompt used). The Demo Doc already has `[TYPE: demo]` so it takes the deterministic branch.
+  - **`matchPhaseHeading`** — runs all three regexes per line. `PHASE_RE` accepts em-dash (—), en-dash (–), and hyphen (-) as the separator. Decimal numbers stay strings; integers convert to `number`. The Demo Doc uses em-dash throughout — verified against the actual Doc content.
+  - **`splitPhaseBody`** — single-pass state machine. The split-regex captures both straight and full-width SAY markers as separate parts; the loop normalizes them and flips mode. The merge-adjacent pass at the end is defensive (empty `[SAY][/SAY]` pairs).
+  - **The phase loop** — accumulates each phase's body lines in document order. Anything before the first heading is silently dropped (preamble: Duration, Goal, Variable syntax notes — not part of the rendered script).
+  - **`.filter(p => p.blocks.length > 0)`** — empty phases (e.g. a trailing heading with no body) get dropped. The current Gemini parser does the same.
+  - **The Demo Doc's quirks** — Phase 2 is missing (script jumps 1.5 → 3), `After the call` sits between Phase 12 and Phase 13, `Quick variable reference` trails Phase 17. The parser emits everything in document order without sequential validation. The `Quick variable reference` block doesn't match any phase heading and isn't inside a phase body, so it gets dropped naturally (no current phase, content discarded). Subsections like `5a.`, `5b.`, `Step 1 — Anchor on the qualify moment`, `### Reflect` don't match `PHASE_RE` (they don't start with `Phase`) — they stay inside their parent phase's body as part of note blocks.
 
-#### Phase 1 / Step 2 — Local test (curl)
+### Phase 1 / Step 2 — Rewire `loadCallScript`
 
-Before deploying, smoke-test the prompt locally against the live Gemini API. From `samwise-backend/cloud-functions/functions/`:
+- **In-file location:** `samwise-backend/cloud-functions/functions/src/index.ts` lines 1244–1293 (the `loadCallScript` export).
+- **Should not be modified:**
+  - The `extractDocId` call, the `getDocsClient` call, the `docs.documents.get` call, `flattenDocToText` invocation, the early 400 guard on missing `googleDocLink`, the surrounding try/catch shape, the 500 fallback. Drive read path stays intact.
+  - The function URL hash — the export name `loadCallScript` is unchanged, so `loadcallscript-b6fhjlgejq-uc.a.run.app` keeps resolving and the frontend's `lib/copilot/load-script.ts` URL constant requires no change.
+- **Code (full replacement of the export body):**
 
-```bash
-pnpm run build && pnpm run serve   # emulator, port 5001 by default
+```ts
+/**
+ * loadCallScript (HTTP)
+ *
+ * Body: { googleDocLink: string }
+ *
+ * Reads the Doc via the Google Docs API, parses it deterministically into
+ * { scriptType, phases }. The Doc uses [SAY]/[/SAY] text markers around
+ * spoken lines and "Phase N — title" headings — see parseScript() above.
+ *
+ * Used by samwise-app/app/copilot/ at session start.
+ */
+export const loadCallScript = onRequest(
+  {cors: true},
+  async (req, res) => {
+    interface LoadCallScriptBody {
+      googleDocLink: string;
+    }
+
+    try {
+      const {googleDocLink} = req.body as LoadCallScriptBody;
+      if (!googleDocLink) {
+        res.status(400).json({error: "googleDocLink required"});
+        return;
+      }
+
+      const docId = extractDocId(googleDocLink);
+      const docs = getDocsClient();
+      const doc = await docs.documents.get({documentId: docId});
+
+      const title = doc.data.title ?? "";
+      const content = flattenDocToText(doc.data.body?.content ?? []);
+
+      const parsed = parseScript(title, content);
+      res.status(200).json(parsed);
+    } catch (err) {
+      logger.error("loadCallScript failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  },
+);
 ```
 
-In another shell, hit the emulator with David's actual `core_motivation` raw:
+- **Explanation:**
+  - The `timeoutSeconds: 120` override is dropped — Drive read is the only remaining slow path (~1–3s typical). Default Cloud Functions timeout suffices.
+  - The Gemini call, the `LOAD_SCRIPT_PROMPT.replace(...)` lines, the `new GoogleGenerativeAI(...)` instantiation, the `model.generateContent(...)` call, and the JSON.parse-with-502-on-failure branch are all removed.
+  - The 502 error path goes away — there's no longer a layer that can return non-JSON.
 
-```bash
-curl -X POST 'http://localhost:5001/<project-id>/us-central1/cleanVariable' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "core_motivation",
-    "rawValue": "to accomplish my other projects, to continue investing in my life, health, mind, learning, and connections, and to not forget my purpose and non-negotiables, all with a clear and tranquil mind",
-    "frameworkSemantics": "The deeper life-stakes reason the prospect wants to change. NOT the behaviour, NOT biographical context — the why behind everything else.",
-    "scriptContexts": [
-      "…porque querés {{core_motivation}}.",
-      "Y realmente necesitás resolver esto porque querés {{core_motivation}}."
-    ]
-  }'
-```
+### Phase 1 / Step 3 — Remove `LOAD_SCRIPT_PROMPT` constant + its imports
 
-**Pass criterion:** the returned `cleaned` is noticeably SHORTER than the raw (target: ≤25 words vs raw ~45 words), is Spanish (matching the slot context), preserves a thrust of David's enumeration (projects, life, health, purpose), and reads grammatically when substituted into the two slots above.
+- **In-file location:** lines 462–465 of `index.ts`:
+  ```ts
+  const LOAD_SCRIPT_PROMPT = fs.readFileSync(
+    path.join(__dirname, "load_call_script_prompt.txt"),
+    "utf8",
+  );
+  ```
+- **Should not be modified:** the other prompt file reads (`ritual_synthesis_prompt.txt`, `extraction_qualification_prompt.txt`, `extraction_tracking_prompt.txt`) all stay. The top-of-file `import fs from "fs"` / `import path from "path"` (or however they're spelled in the file) stays — used by the other prompt readers.
+- **Code:** delete the four-line block. Also delete the standalone comment block immediately above it (lines 458–460) that describes the prompt's purpose.
+- **Explanation:** straightforward removal. No reference to `LOAD_SCRIPT_PROMPT` will remain after Step 2.
 
-**Fail signals to fix and retry:**
-- Returned phrase is the same length or longer than raw → tighten the SYNTHESIZE rule with even more explicit "DROP filler" examples.
-- Returned phrase loses David's voice (e.g. collapses to "vivir mejor") → tighten the "preserve voice" rule.
-- Returned phrase is in English → check that the script-context Spanish is being rendered correctly into the prompt.
+### Phase 1 / Step 4 — Delete `load_call_script_prompt.txt`
 
-Repeat curl with `behaviour_to_change` raw = `"getting unstuck"` → expect a short Spanish phrase (`estar estancado` / `salir del estancamiento`).
+- **File:** `samwise-backend/cloud-functions/functions/src/load_call_script_prompt.txt`.
+- **Action:** delete.
+- **Explanation:** unused after Step 3. Keeping it as a graveyard reference is anti-pattern; the prior content is recoverable from git.
 
-Repeat curl with `symbolic_anchor_description` raw = `"Nietzsche, the idea of the superhuman, and the obligation to be critical and think twice about what the system tells me, also aestheticism"` and slot context (read from the script Doc) → expect short Spanish that retains Nietzsche / superhombre / crítica.
+### Phase 1 / Step 5 — Drop the prompt file from the build copy step
 
-#### Phase 1 / Step 3 — Deploy
-
-From `samwise-backend/cloud-functions/functions/`:
-
-```bash
-pnpm run build && firebase deploy --only functions:cleanVariable
-```
-
-The function URL hash (`cleanvariable-b6fhjlgejq-uc.a.run.app`) does NOT change on redeploy when only the function body changes — frontend constant in `samwise-app/lib/copilot/clean-variable.ts` requires no update.
-
-#### Phase 1 / Step 4 — Integration test
-
-Covered by Phase 3 of the frontend sister plan (load David's qualification end-to-end in `/copilot`). No additional integration test needed on the backend side.
-
-#### Phase 1 / Step 5 — Update README
-
-`samwise-backend/cloud-functions/` has a README. The README does NOT currently document `cleanVariable`'s exact prompt behavior — it would couple the README to the prompt, which is the wrong layer to document there. The synthesis-vs-paraphrase decision is documented (a) in this `current-plan.md`, (b) in code comments adjacent to `buildCleanVariablePrompt`, and (c) in the `samwise-session-copilot` skill ("Tuning the cleaning" section). Skip README edit.
+- **File:** `samwise-backend/cloud-functions/functions/package.json`.
+- **Change:** in the `build` script, remove `&& cp src/load_call_script_prompt.txt lib/`.
+- **Before:**
+  ```
+  "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/ && cp src/load_call_script_prompt.txt lib/ && cp src/extraction_qualification_prompt.txt lib/ && cp src/extraction_tracking_prompt.txt lib/"
+  ```
+- **After:**
+  ```
+  "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/ && cp src/extraction_qualification_prompt.txt lib/ && cp src/extraction_tracking_prompt.txt lib/"
+  ```
+- **Explanation:** without the source file, `cp` would fail and break every build.
 
 ---
 
@@ -136,15 +318,31 @@ Covered by Phase 3 of the frontend sister plan (load David's qualification end-t
 
 ### Local test (always)
 
-Phase 1 / Step 2 above — curl against the local emulator with David's three real raw values.
+A pure-function offline test against a fixture of the actual Demo Doc text:
+
+1. From `samwise-backend/cloud-functions/functions/`, run `pnpm run build` — must succeed with no TypeScript errors. (`parseScript` has explicit signatures; tsc verifies the return shape.)
+2. Spin a Node REPL or one-off script that requires the built `lib/index.js`, calls `parseScript(title, content)` with a stub of the canonical Doc text (paste a representative excerpt — Phase 1 through Phase 1.5, plus Phase 8.5 and Phase 12, plus "After the call" — into a JS string), and prints the JSON output.
+
+   **Pass criteria:**
+   - `scriptType === "demo"`.
+   - `phases.map(p => p.number)` contains `1`, `"1.5"`, `3`, `4`, `5`, `6`, `7`, `8`, `"8.5"`, `9`, ..., `"post-call"`, `13`, ..., `17` in document order. (Phase 2 is absent — that's correct.)
+   - Phase 1's blocks include a `kind: "say"` block whose text starts with `Hola. Que bueno tenerte aquí.` and DOES NOT contain the literal `[SAY]` or `[/SAY]` strings.
+   - Phase 9's first note block contains `[CONDITION: fit_state=qualified]` as one of its lines (the frontend filter relies on this surviving).
+   - `{{behaviour_to_change}}`, `{{core_motivation}}`, `{{symbolic_anchor_description}}` placeholders are preserved EXACTLY inside say-block text.
+   - Phase 8.5's `number === "8.5"` (string form).
+   - The post-call phase has `number === "post-call"` and contains the "outcome / next_step / rep_notes" content.
+
+3. Quick negative test: pass a content string that does not contain `[TYPE:]` and has no recognizable keywords → expect `scriptType === "unknown"`. Pass an empty content → expect `phases === []`.
 
 ### Integration test
 
-Frontend sister plan's Phase 3 — end-to-end load of David's qualification into `/copilot`, screenshot proof.
+After deploy:
+- Open `/copilot` in samwise-app, paste the canonical Demo Doc URL, click load.
+- Expect: load completes in ~1–3s instead of 5–15s. The visual output (phases, say cards, note prose, condition-filtered phases when `fit_state` toggles) is identical to what Gemini produced. Test the qualified vs still_disqualified branches by flipping `fit_state` in the variables-table — Phases 9–15 hide/show vs Phases 16–17.
 
 ### Update README
 
-Skipped — see Phase 1 / Step 5.
+The `samwise-backend/cloud-functions/` README does not currently document `loadCallScript`'s internals (only its existence). The internal switch from Gemini to a parser is documented in (a) the inline JSDoc on `parseScript`, (b) the `samwise-session-copilot` skill, and (c) the Recent Changes entry in `context-for-code-agent.md`. Skip README edit.
 
 ---
 
@@ -152,12 +350,18 @@ Skipped — see Phase 1 / Step 5.
 
 ### Update `samwise-backend/cloud-functions/functions/src/context-for-code-agent.md`
 
-No structural change to the module — same files, same exports, same env vars. The prompt edit is documented in code comments at `buildCleanVariablePrompt`. Skip.
+Append a new entry to the "Recent Changes" section dated 2026-05-26:
+- The Gemini call inside `loadCallScript` was removed in favour of a pure `parseScript()` function. Doc convention (`[TYPE: demo]` marker + `Phase N — title` headings + `[SAY]/[/SAY]` text markers) is deterministic enough that the LLM is doing no real reasoning. Latency drops from 5–15s to ~1–3s (Drive read only). The `load_call_script_prompt.txt` file and its build-time copy are deleted. The function URL is unchanged.
+
+Update the `loadCallScript` row in the Module Overview section: drop the "asks Gemini to parse it" / "Model gemini-2.5-flash, timeoutSeconds: 120" wording; replace with "parses it deterministically via `parseScript()` using `[SAY]/[/SAY]` and `Phase N — title` markers."
 
 ### Update `samwise-session-copilot` skill
 
-Append a short note under section "1. Cleaning aims for script-fit, not canonical-generic form": *"Updated 2026-05-21: synthesis is REQUIRED, not optional. The previous 'do not collapse a vivid description into a generic abstract noun' rule was too conservative — Gemini read it as 'do not synthesize.' The new rule keeps voice and metaphor protection but explicitly names paraphrase-without-shortening as a failure."* Done as a quick skill edit after the fix lands.
+In `/Users/samuelgiraldoconcha/Documents/samwise/.claude/skills/samwise-session-copilot/SKILL.md`:
+- Update the `loadCallScript` row in the three-functions table — drop the "Gemini parse" and "Model gemini-2.5-flash, timeoutSeconds: 120" mentions; replace with "deterministic `parseScript()` in TypeScript — no LLM."
+- Add a short note under "The three cloud functions" stating that the parser swap happened 2026-05-26 and the contract (output JSON shape) is unchanged.
+- The `[SAY]/[/SAY]` marker convention section stays untouched — it's now load-bearing for the parser (was load-bearing for Gemini's deterministic instruction before).
 
 ### Mark task DONE
 
-User manually marks **"Improve the copilot"** as **DONE** in the master Vibe doc Projects tab.
+User manually marks the corresponding task in the master Vibe doc Projects tab.

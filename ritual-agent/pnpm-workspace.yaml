@@ -4,3 +4,5 @@ ignoredBuiltDependencies:
   - onnxruntime-node
   - protobufjs
   - sharp
+patchedDependencies:
+  '@livekit/agents-plugin-google': patches/@livekit__agents-plugin-google.patch

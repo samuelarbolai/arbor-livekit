@@ -455,12 +455,26 @@ const SYNTHESIS_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
-// Phase-extraction prompt used by loadCallScript. Same loading pattern as
-// SYNTHESIS_PROMPT above — the build script copies the .txt file to lib/
-// so __dirname resolution works at runtime. Edits to this prompt are
-// free-form (no skill governs it) — it's a small JSON-out parsing task.
-const LOAD_SCRIPT_PROMPT = fs.readFileSync(
-  path.join(__dirname, "load_call_script_prompt.txt"),
+// Extraction prompt used by extractQualification. Same loading pattern.
+// Reads a qualification-call transcript (Nova ↔ prospect) and emits the
+// structured QualificationPayload as JSON. Sits at the "scribe" end of
+// the agent/scribe split: the qualification agent (in ritual-agent's
+// flows/qualification/) just converses and takes live notes, then the
+// worker POSTs the transcript here at end-of-call or on disconnect.
+const QUALIFICATION_EXTRACTION_PROMPT = fs.readFileSync(
+  path.join(__dirname, "extraction_qualification_prompt.txt"),
+  "utf-8"
+);
+
+// Extraction prompt used by extractTrackingKpis. Same loading pattern.
+// Reads a tracking-call transcript (tracking-agent ↔ user) and emits a
+// TrackingState JSON object — one KpiBundle per ritual, keyed by
+// googleDocId. Sits at the "scribe" end of the agent/scribe split:
+// tracking-agent (in samwise-backend/tracking-agent/) just converses,
+// then its worker POSTs the transcript here at end-of-call. Mirrors the
+// converse → extract pattern of extractQualification.
+const TRACKING_EXTRACTION_PROMPT = fs.readFileSync(
+  path.join(__dirname, "extraction_tracking_prompt.txt"),
   "utf-8"
 );
 
@@ -1207,66 +1221,253 @@ function flattenDocToText(content: Array<unknown>): string {
   return lines.join("");
 }
 
+/* eslint-disable max-len */
+/**
+ * parseScript — deterministic Doc-text → {scriptType, phases} parser.
+ *
+ * Replaces the Gemini-backed parse loadCallScript used through 2026-05-26.
+ * The Doc uses three explicit conventions that make this a pure string job:
+ *
+ *   - `[TYPE: demo|onboarding|call_design]` — optional standalone line near
+ *     the top of the Doc. When present, authoritative. Falls back to
+ *     title/content keyword matching.
+ *
+ *   - Phase headings — `Phase N — title` or `Phase N.M — title` (em-dash,
+ *     en-dash, or hyphen). Decimal phases keep string form ("1.5", "8.5");
+ *     integers emit as number. `Pre-call …` / `After the call …` /
+ *     `Post-call …` open the special "pre-call" / "post-call" phases.
+ *     Phases are emitted in DOCUMENT order, not numeric order (the Demo
+ *     Doc puts "After the call" between Phase 12 and Phase 13).
+ *
+ *   - Body blocks — split on `[SAY]` / `[/SAY]` text tokens. Inside = "say",
+ *     outside = "note". `[CONDITION: var=value]` lines stay inside note
+ *     blocks; the frontend filters them per-line in script-pane.tsx.
+ */
+type ScriptType = "demo" | "onboarding" | "call_design" | "unknown";
+type ParsedBlock = {kind: "say" | "note"; text: string};
+type ParsedPhase = {
+  number: number | string;
+  title: string;
+  blocks: ParsedBlock[];
+};
+
+const TYPE_MARKER_RE = /\[TYPE:\s*(demo|onboarding|call_design)\s*\]/i;
+const VERSION_MARKER_RE = /\[VERSION:\s*([^\]]+?)\s*\]/i;
+// Phase headings require whitespace on BOTH sides of the separator. This
+// distinguishes real headings like "Phase 1 — Set validations" from range
+// notation in meta lists like "Phase 5–8: thoughts_during_relapse, ...".
+const PHASE_RE = /^\s*Phase\s+(\d+(?:\.\d+)?)\s+[—–-]\s+(.+?)\s*$/;
+// Negative lookahead `(?!:)` rejects colon-followed forms like
+// "Pre-call: prospect_name, …" / "Post-call: outcome, …" that appear in
+// variable-reference meta sections. Real phase headings use a dash
+// separator or have no immediate colon ("After the call (fill within …)").
+const PRECALL_RE = /^\s*Pre-?call\b(?!:).*$/i;
+const POSTCALL_RE = /^\s*(?:After the call|Post-?call)\b(?!:).*$/i;
+// Standalone "[END]" line — terminates the renderable script. Anything
+// after (variable references, changelog, internal notes) is dropped.
+const END_MARKER_RE = /^\s*\[END\]\s*$/i;
+// Split on both straight and full-width brackets — Google Docs sometimes
+// autocorrects `[` to `［`.
+const SAY_SPLIT_RE = /(\[\/?SAY\]|［\/?SAY］)/;
+
+/**
+ * Detects scriptType from the `[TYPE: ...]` marker (authoritative) with a
+ * keyword fallback against title + first 500 chars of content.
+ * @param {string} title Doc title.
+ * @param {string} content Flattened Doc text.
+ * @return {ScriptType} demo / onboarding / call_design / unknown.
+ */
+function detectScriptType(title: string, content: string): ScriptType {
+  const head = content.slice(0, 500);
+  const m = head.match(TYPE_MARKER_RE) ?? title.match(TYPE_MARKER_RE);
+  if (m) {
+    const v = m[1].toLowerCase();
+    if (v === "demo" || v === "onboarding" || v === "call_design") return v;
+  }
+  const haystack = `${title}\n${head}`.toLowerCase();
+  if (/demo call|compatibility & welcome/.test(haystack)) return "demo";
+  if (/dra\.\s*ana\s*mar[ií]a|onboarding/.test(haystack)) return "onboarding";
+  if (/call\s+design|ritual\s+design/.test(haystack)) return "call_design";
+  return "unknown";
+}
+
+/**
+ * Splits a phase body into alternating say/note blocks using [SAY]/[/SAY]
+ * text markers as the deterministic boundary.
+ * @param {string} body Flat phase body text.
+ * @return {ParsedBlock[]} Ordered blocks; empty blocks dropped.
+ */
+function splitPhaseBody(body: string): ParsedBlock[] {
+  const blocks: ParsedBlock[] = [];
+  let mode: "say" | "note" = "note";
+  let buf: string[] = [];
+  const flush = () => {
+    const text = buf.join("").trim();
+    if (text) blocks.push({kind: mode, text});
+    buf = [];
+  };
+  for (const part of body.split(SAY_SPLIT_RE)) {
+    if (!part) continue;
+    const norm = part.replace("［", "[").replace("］", "]");
+    if (norm === "[SAY]") {
+      flush();
+      mode = "say";
+    } else if (norm === "[/SAY]") {
+      flush();
+      mode = "note";
+    } else {
+      buf.push(part);
+    }
+  }
+  flush();
+  // Merge consecutive same-kind blocks (defensive — empty [SAY][/SAY]
+  // pairs could leave gaps).
+  const merged: ParsedBlock[] = [];
+  for (const b of blocks) {
+    const last = merged[merged.length - 1];
+    if (last && last.kind === b.kind) {
+      last.text = `${last.text}\n${b.text}`.trim();
+    } else {
+      merged.push({...b});
+    }
+  }
+  return merged;
+}
+
+interface PhaseHeading {
+  number: number | string;
+  title: string;
+}
+
+/**
+ * Returns the parsed heading for a phase-opening line, or null if the line
+ * does not start a phase. Accepts "Phase N — title", "Phase N.M — title",
+ * "Pre-call …", "After the call …", and "Post-call …".
+ * @param {string} line One line of the flattened Doc.
+ * @return {PhaseHeading | null} Heading shape or null.
+ */
+function matchPhaseHeading(line: string): PhaseHeading | null {
+  const m = PHASE_RE.exec(line);
+  if (m) {
+    const numStr = m[1];
+    const number: number | string = numStr.includes(".") ?
+      numStr :
+      parseInt(numStr, 10);
+    return {number, title: m[2].trim()};
+  }
+  if (PRECALL_RE.test(line)) {
+    return {number: "pre-call", title: line.trim()};
+  }
+  if (POSTCALL_RE.test(line)) {
+    return {number: "post-call", title: line.trim()};
+  }
+  return null;
+}
+
+/**
+ * Detects the optional `[VERSION: x.y]` marker near the top of the Doc.
+ * @param {string} content Flattened Doc text.
+ * @return {string | undefined} The version string (whitespace-trimmed) or
+ *   undefined if the marker is absent.
+ */
+function detectVersion(content: string): string | undefined {
+  const m = content.slice(0, 500).match(VERSION_MARKER_RE);
+  return m ? m[1].trim() : undefined;
+}
+
+/**
+ * Parses a Samwise call-script Doc into {scriptType, version, phases}.
+ * Pure function; no I/O. See the parseScript banner comment above for the
+ * conventions this relies on. `version` is omitted when the Doc has no
+ * `[VERSION: ...]` marker.
+ * @param {string} title Doc title from docs.documents.get → data.title.
+ * @param {string} content Flattened Doc text from flattenDocToText.
+ * @return {object} { scriptType, version?, phases }.
+ */
+export function parseScript(
+  title: string,
+  content: string,
+): {scriptType: ScriptType; version?: string; phases: ParsedPhase[]} {
+  const scriptType = detectScriptType(title, content);
+  const version = detectVersion(content);
+
+  const lines = content.split(/\r?\n/);
+  type Bucket = PhaseHeading & {bodyLines: string[]};
+  const buckets: Bucket[] = [];
+  let current: Bucket | null = null;
+
+  for (const line of lines) {
+    if (END_MARKER_RE.test(line)) break;
+    const heading = matchPhaseHeading(line);
+    if (heading) {
+      current = {...heading, bodyLines: []};
+      buckets.push(current);
+    } else if (current) {
+      current.bodyLines.push(line);
+    }
+    // Lines before the first heading are dropped (preamble).
+  }
+
+  const phases: ParsedPhase[] = buckets
+    .map((b) => ({
+      number: b.number,
+      title: b.title,
+      blocks: splitPhaseBody(b.bodyLines.join("\n")),
+    }))
+    .filter((p) => p.blocks.length > 0);
+
+  return version ? {scriptType, version, phases} : {scriptType, phases};
+}
+/* eslint-enable max-len */
+
 /**
  * loadCallScript (HTTP)
  *
  * Body: { googleDocLink: string }
  *
- * Reads the Doc via the Google Docs API, asks Gemini to parse it into a
- * phases array, returns { scriptType, phases }. Mirrors registerNewRitual's
- * shape but with a phase-extraction prompt instead of a synthesis prompt.
+ * Reads the Doc via the Google Docs API, then parses it deterministically
+ * via parseScript() into { scriptType, phases }. The Doc uses [SAY]/[/SAY]
+ * text markers around spoken lines and "Phase N — title" headings — see
+ * parseScript() above. No LLM in the loop; the previous Gemini parse was
+ * removed 2026-05-26 once the marker convention made it redundant.
  *
  * Used by samwise-app/app/copilot/ at session start.
  */
 export const loadCallScript = onRequest(
-  {cors: true, timeoutSeconds: 120},
+  {cors: true},
   async (req, res) => {
-  interface LoadCallScriptBody {
-    googleDocLink: string;
-  }
+    // Never cache: the therapist/rep must always get the live Google
+    // Doc. Set before any branch so it covers success AND error paths.
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
 
-  try {
-    const {googleDocLink} = req.body as LoadCallScriptBody;
-    if (!googleDocLink) {
-      res.status(400).json({error: "googleDocLink required"});
-      return;
+    interface LoadCallScriptBody {
+      googleDocLink: string;
     }
 
-    const docId = extractDocId(googleDocLink);
-    const docs = getDocsClient();
-    const doc = await docs.documents.get({documentId: docId});
-
-    const title = doc.data.title ?? "";
-    const content = flattenDocToText(doc.data.body?.content ?? []);
-
-    const filledPrompt = LOAD_SCRIPT_PROMPT
-      .replace("{{DOC_TITLE}}", title)
-      .replace("{{DOC_CONTENT}}", content);
-
-    const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
-    const model = gemini.getGenerativeModel({
-      model: "gemini-2.5-flash",
-      generationConfig: {responseMimeType: "application/json"},
-    });
-    const result = await model.generateContent(filledPrompt);
-    const text = result.response.text();
-
-    let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
-    } catch {
-      logger.error("loadCallScript: Gemini returned non-JSON", {text});
-      res.status(502).json({error: "Gemini returned non-JSON"});
-      return;
-    }
+      const {googleDocLink} = req.body as LoadCallScriptBody;
+      if (!googleDocLink) {
+        res.status(400).json({error: "googleDocLink required"});
+        return;
+      }
 
-    res.status(200).json(parsed);
-  } catch (err) {
-    logger.error("loadCallScript failed", err);
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({error: message});
-  }
-  }
+      const docId = extractDocId(googleDocLink);
+      const docs = getDocsClient();
+      const doc = await docs.documents.get({documentId: docId});
+
+      const title = doc.data.title ?? "";
+      const content = flattenDocToText(doc.data.body?.content ?? []);
+
+      const parsed = parseScript(title, content);
+      res.status(200).json(parsed);
+    } catch (err) {
+      logger.error("loadCallScript failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  },
 );
 
 /* eslint-disable max-len */
@@ -1389,6 +1590,263 @@ export const cleanVariable = onRequest({cors: true}, async (req, res) => {
     res.status(200).json({cleaned: rawValue});
   }
 });
+
+/* eslint-disable max-len */
+/**
+ * SuggestTechnique
+ *
+ * The set of in-call rep-line generation techniques the Demo Call uses.
+ * Each technique produces ONE Spanish SAY line tuned to the prospect's
+ * context. See buildSuggestRepLinePrompt for the per-technique prompt.
+ */
+type SuggestTechnique =
+  | "phase_1_5_worldview_confirmation"
+  | "phase_10_alternatives_failure_reflection"
+  | "ifs_reframe"
+  | "amplification_two_poles"
+  | "synthesis_offer"
+  | "trajectory_push";
+
+/**
+ * Builds the per-technique prompt for suggestRepLine. The frontend passes
+ * the technique + the captured-so-far state; the prompt is dispatched on
+ * technique with state values inlined as plain text.
+ * @param {object} args Suggestion request body.
+ * @return {string} The full prompt to send to Gemini.
+ */
+function buildSuggestRepLinePrompt(args: {
+  technique: SuggestTechnique;
+  state: Record<string, string>;
+  language?: "es" | "en";
+}): string {
+  const s = args.state;
+  const get = (k: string): string => (s[k] ?? "").trim();
+  const has = (k: string): boolean => get(k).length > 0;
+  // Pre-call context block used by most techniques. Only includes vars
+  // that are non-empty so Gemini doesn't see "X: " noise.
+  const lines: string[] = [];
+  const push = (k: string, label?: string) => {
+    if (has(k)) lines.push(`- ${label ?? k}: ${get(k)}`);
+  };
+  push("behaviour_to_change");
+  push("core_motivation");
+  push("life_stage_context");
+  push("problem_duration_self_reported");
+  push("symbolic_anchor_type");
+  push("symbolic_anchor_description");
+  push("alternatives_tried");
+  push("why_alternatives_failed");
+  // Phase 5b in-flight captures (may be empty depending on which step
+  // the rep is at).
+  push("feelings_during_relapse");
+  push("intention_behind_action");
+  push("thoughts_during_relapse");
+  push("self_talk_after_relapse");
+  push("view_of_their_life_in_that_moment");
+  const contextBlock = lines.length > 0 ?
+    `PROSPECT CONTEXT (only non-empty fields shown):
+${lines.join("\n")}` :
+    "PROSPECT CONTEXT: (none — nothing captured yet)";
+
+  const persona = "PERSONA: The rep speaks in the voice of an expensive, centered, self-aware female clinician — Carolina Borrero reference. Calm, never desperate, mirrors the prospect's register. Never uses clinical-coded vocabulary in spoken output (no \"paciente\", no \"comportamiento autodestructivo\", no \"recaída\", no \"clínico/clínicamente\"). Spanish uses the vos register (Argentine). Lines are short — the rep is going to say this aloud.";
+
+  const common = `\n\n${contextBlock}\n\n${persona}\n\nReturn ONLY the SAY line — no labels, no JSON, no surrounding quotes, no preamble.\n\nSAY LINE:`;
+
+  switch (args.technique) {
+  case "phase_1_5_worldview_confirmation": {
+    const anchorType = get("symbolic_anchor_type");
+    if (!anchorType || anchorType === "none" || anchorType === "unknown") {
+      // Caller should not even invoke this technique in this case;
+      // return an empty marker the frontend can detect.
+      return "__SKIP__:no symbolic anchor on file";
+    }
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for the opening reflection (Phase 1.5) of a Demo Call. The rep is about to play back what the prospect shared in the Fit Assessment. THIS specific line is a one-sentence worldview confirmation — a reflection of HOW the prospect sees the world (philosophical, religious, hyper-rational, etc.) that signals the rep was paying attention to their register, not just their facts.
+
+TECHNIQUE: Use the prospect's exact tradition/philosophy by name where they used a specific one. If they mentioned Stoicism → say "estoicismo". If Catholic prayer → "la oración católica". If a specific philosopher or book → name it. If "hyper-rational" → signal that register without naming a tradition. NEVER generalize to "spirituality" or "religion" — that's the failure mode.
+
+SHAPE: "Y también veo que [reflection of their worldview in their language, 1–2 short clauses, max 25 words]."${common}`;
+  }
+
+  case "phase_10_alternatives_failure_reflection": {
+    const why = get("why_alternatives_failed");
+    const alts = get("alternatives_tried");
+    if (!why || why === "none" || why === "unknown" ||
+        !alts || alts === "none" || alts === "unknown") {
+      // Caller should not even invoke this technique in this case;
+      // return an empty marker the frontend can detect.
+      return "__SKIP__:no alternatives data on file";
+    }
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for Phase 10 (Eliminate perception of risk, just before Price) of a Demo Call. This is the line that bridges the rep's setup ("Antes de hablar de inversión, quiero dejarte algo claro.") and the one-month money-back guarantee. It reflects empathically why the prospect's prior alternatives didn't work, anchoring the guarantee in something specific to THIS prospect rather than abstract.
+
+TECHNIQUE: Take what the prospect captured in the Fit Assessment about their tried alternatives (alternatives_tried) and why they failed (why_alternatives_failed). The raw values are rep notes — often verbatim, possibly ungrammatical, possibly long. Produce ONE clean Spanish sentence that:
+- Names their specific alternatives by short reference (e.g. "la terapia individual", "los retiros y la meditación", "los libros y los videos"), NOT a generic "todo lo que has probado"
+- Reflects the why-it-failed cleanly — rephrase as smooth prose, do not paste the raw value
+- Ends with a short empathic validation clause that the failure makes sense given who they are
+
+SHAPE: "Vos ya me contaste que lo que no terminó de servirte de [specific alternatives, short] fue [cleaned reason], y eso tiene sentido [optional half-clause tying to their situation]."
+
+GOOD examples (the shape — specific, empathic, smoothly phrased):
+- "Vos ya me contaste que lo que no terminó de servirte de la terapia individual fue que no aterrizaba en acciones concretas, y eso tiene sentido — necesitabas algo que te empuje, no solo que te escuche."
+- "Vos ya me contaste que con la meditación y los retiros, lo que faltó fue continuidad — funcionaba esos días y después se diluía."
+
+BAD examples (avoid — generic, vague, or just pasted-through):
+- "Sé que has probado muchas cosas y nada funcionó."
+- "Las alternativas que probaste no te dieron resultados."
+- (pasting the raw why_alternatives_failed value verbatim)
+
+Keep the line under 35 words.${common}`;
+  }
+
+  case "ifs_reframe": {
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for Step 5 of Phase 5b in a Demo Call. The technique is the IFS (Internal Family Systems) reframe — the rep frames the prospect's relapse-action as a "part" of them trying to do something for them, rather than as a moral failure. This is the load-bearing move of Phase 5b: it creates desidentification distance EARLY so the steps that follow (thoughts, self-talk) can surface honestly without ego defense.
+
+TECHNIQUE: Weave the prospect's action (from behaviour_to_change, in past tense, third-person — "esa parte tuya que [VERB-PHRASE]") and their feelings (echoed naturally) into the IFS opening. End with the three-part question: "¿qué estaba tratando de hacer por vos? ¿De qué te estaba sacando? ¿O hacia qué te estaba llevando?"
+
+SHAPE: "Esa parte tuya que [verb-phrase from behaviour_to_change, past tense third-person] — sintiendo [echo of feelings, brief, in their words] — ¿qué estaba tratando de hacer por vos? ¿De qué te estaba sacando? ¿O hacia qué te estaba llevando?"
+
+Adapt the verb-phrase grammatically (must read clean in third person). If feelings_during_relapse is empty, drop the feelings echo and just use the action. Keep the whole line under 40 words.${common}`;
+  }
+
+  case "amplification_two_poles": {
+    // We don't know which variable is being filled — frontend tells
+    // us via state-keys present. If thoughts is empty but we're being
+    // asked for amplification, it's for thoughts (Step 6). If thoughts
+    // is filled but self-talk is empty, it's for self-talk (Step 7).
+    const isSelfTalk = has("thoughts_during_relapse");
+    const target = isSelfTalk ? "self-talk AFTER the relapse" :
+      "thoughts DURING the relapse";
+    const targetVar = isSelfTalk ?
+      "self_talk_after_relapse" : "thoughts_during_relapse";
+    const targetVarLabel = isSelfTalk ?
+      "verbatim things the prospect TOLD THEMSELVES after the relapse was over (e.g. \"qué mierda, otra vez perdí la tarde\", \"bueno, mañana sí\")" :
+      "thoughts the prospect was HAVING DURING the relapse moment (e.g. \"cinco minutos y vuelvo\", \"esto no importa, mañana arranco\")";
+
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for ${isSelfTalk ? "Step 7" : "Step 6"} of Phase 5b in a Demo Call. The technique is two-pole amplification — the rep proposes TWO DELIBERATELY OPPOSED options the prospect might have ${isSelfTalk ? "said to themselves" : "thought"}, plus an "algo más feo" escape-hatch tail. The contrast between the two options is LOAD-BEARING — if both options are similar in tone, the technique fails because the prospect just nods.
+
+TARGET: ${target} — i.e., the variable {{${targetVar}}}. Concretely: ${targetVarLabel}.
+
+POLE DEFINITIONS (this is critical):
+- OPTION A = minimizing / self-permissive / kicking the can ("mañana sí", "no fue para tanto", "cinco minutos más")
+- OPTION B = self-blaming / harsh / shame-driven ("soy un desastre", "qué mierda, otra vez", "siempre lo mismo")
+- Option A and Option B MUST sit on opposite poles. If you can't tell which is which, you're not making them opposed enough.
+
+SHAPE: "¿Algo como '[OPTION A — short verbatim-style quote, ≤10 words, in their voice]'? ¿O era más '[OPTION B — short verbatim-style quote, ≤10 words, in their voice]'? ¿O algo más feo que eso?"
+
+Adapt each option to THIS prospect's vocabulary and life-stage (use core_motivation, life_stage_context, prior captured Phase 5b values to pick words that sound like THEM, not like a generic prospect).${common}`;
+  }
+
+  case "synthesis_offer": {
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for Step 8 of Phase 5b in a Demo Call. The technique is synthesis amplification — the rep takes everything captured so far in Phase 5b (feelings, intention, thoughts, self-talk) and offers a SINGLE synthesis of how the prospect saw their LIFE in that moment, for the prospect to confirm/correct/refine. A WRONG synthesis is still a successful move because the prospect's correction is the highest-fidelity data point of the phase. The synthesis must be CONCRETE and VIVID — a metaphor or image, NOT an abstract noun phrase.
+
+TECHNIQUE: First, echo briefly what they shared in steps 4–7 (one short clause stringing feelings + thoughts + self-talk together). Then offer the synthesis as a metaphor or vivid image. End by inviting confirmation or correction.
+
+GOOD synthesis examples (these are the SHAPE you want — vivid, concrete, reactable):
+- "una rueda de la que no podés salir"
+- "algo que ya no te pertenece"
+- "una pelea perdida que seguís peleando"
+- "un sótano del que no encontrás la escalera"
+- "estar viviendo la vida de otro"
+
+BAD synthesis examples (these are the shape you want to AVOID — abstract, generic, unreactable):
+- "una vida difícil"
+- "un estado de tristeza"
+- "una situación complicada"
+- "algo que no podés controlar"
+
+SHAPE: "Por cómo me lo describís — [eco breve uniendo feelings + thoughts + self-talk en una sola frase corta] — suena como que en ese momento tu vida se veía como [síntesis vívida — metáfora o imagen concreta]. ¿Se parece a eso? ¿O era distinto?"
+
+Keep the whole line under 50 words. Adapt the metaphor to this prospect's life context and vocabulary.${common}`;
+  }
+
+  case "trajectory_push": {
+    const duration = get("problem_duration_self_reported");
+    const durationHint = duration ?
+      `The prospect has been struggling with this for: "${duration}". Pick time horizons that feel pointed against that — if they've been at it for years already, "seis meses más" + "al año" feels heavier than "diez años más".` :
+      "No duration on file; use generic horizons (\"seis meses más\" / \"al año\").";
+
+    return `You are helping a sales rep at a behavior-change company prepare a SAY line for Step 9 (consequences) of Phase 5b in a Demo Call. The technique is trajectory-push — when the prospect minimizes the consequences ("tampoco es para tanto"), the rep reframes into a FUTURE trajectory to surface the cost they're denying in the present. Future losses are easier to admit than present ones.
+
+TECHNIQUE: Reference the time scale of their existing struggle, then ask where they'll be at one short horizon and one longer one. ${durationHint}
+
+SHAPE: "Si esto sigue igual [SHORT horizon — e.g. 'seis meses más'], ¿dónde estás? ¿Y [LONGER horizon — e.g. 'al año'/'a los dos años']?"
+
+Keep it tight — under 25 words.${common}`;
+  }
+
+  default:
+    // Exhaustiveness guard. If a new technique is added to the union,
+    // TS will complain here.
+    return `__SKIP__:unknown technique "${args.technique}"`;
+  }
+}
+/* eslint-enable max-len */
+
+/**
+ * suggestRepLine (HTTP)
+ *
+ * Body: {
+ *   technique: SuggestTechnique,
+ *   state: Record<string, string>,  // captured variables (raw or cleaned)
+ *   language?: "es" | "en"
+ * }
+ * Response: { line: string }
+ *
+ * Generates ONE Spanish (or English) SAY line tuned to the prospect's
+ * context using the named technique. Used by /copilot's pre-generation
+ * mechanism: when a triggering variable is captured, the frontend calls
+ * suggestRepLine with the current state and caches the result for the
+ * rep to reveal on demand during the step the line belongs to.
+ *
+ * Stateless. Falls back to returning a small marker string on any
+ * error so the frontend never blocks on a failed call.
+ */
+export const suggestRepLine = onRequest(
+  {cors: true, timeoutSeconds: 60},
+  async (req, res) => {
+    interface SuggestBody {
+      technique: SuggestTechnique;
+      state?: Record<string, string>;
+      language?: "es" | "en";
+    }
+
+    try {
+      const body = req.body as SuggestBody;
+      if (!body || !body.technique) {
+        res.status(400).json({error: "technique required"});
+        return;
+      }
+
+      const prompt = buildSuggestRepLinePrompt({
+        technique: body.technique,
+        state: body.state ?? {},
+        language: body.language,
+      });
+
+      // Skip marker — the prompt builder decided generation is not
+      // applicable (e.g., no symbolic anchor for Phase 1.5 line).
+      if (prompt.startsWith("__SKIP__")) {
+        res.status(200).json({line: ""});
+        return;
+      }
+
+      const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+      const model = gemini.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: {temperature: 0.7},
+      });
+      const result = await model.generateContent(prompt);
+      const line = result.response.text().trim();
+
+      // Trim wrapping quotes if Gemini decided to wrap the line.
+      const stripped = line.replace(/^["'`]|["'`]$/g, "").trim();
+      res.status(200).json({line: stripped});
+    } catch (err) {
+      logger.error("suggestRepLine failed", err);
+      // Soft-fail: frontend shows a "no suggestion available" state.
+      res.status(200).json({line: ""});
+    }
+  }
+);
 
 /**
  * appendDemoCallRow (HTTP)
@@ -1516,6 +1974,7 @@ export const submitQualification = onRequest(
 
       // Priority 2 — captured iff Priority 1 passes (else absent)
       behaviour_to_change?: string;
+      behaviour_example?: string;
       core_motivation?: string;
       problem_duration_self_reported?: string;
       life_stage_context?: string;
@@ -1642,3 +2101,522 @@ export const loadQualification = onRequest(
     }
   }
 );
+
+/**
+ * extractQualification (HTTP, CORS-enabled) — A4 of the
+ * converse → extract redesign.
+ *
+ * The qualification agent (in ritual-agent's flows/qualification/) no
+ * longer fills schemas during the call — it just converses and takes
+ * live notes. At end-of-call (endCall tool OR participantDisconnected
+ * OR idle_timeout), the worker POSTs the transcript here. This function:
+ *   1. Runs Gemini 2.5 Flash with QUALIFICATION_EXTRACTION_PROMPT to turn
+ *      the transcript into a QualificationPayload-shaped JSON.
+ *   2. Computes outcome (qualified vs disqualified) from the three gate
+ *      fields. Same rubric as the legacy submitQualification.
+ *   3. Writes qualifications/{prospectKey}-{ts} doc (same shape +
+ *      identity-chain as submitQualification).
+ *   4. Writes a mail/ doc to trigger the Firebase Trigger Email
+ *      extension (Gmail SMTP) — post-call confirmation email to the
+ *      prospect, reply-to Samuel's gmail.
+ *
+ * Body: {
+ *   transcript: Array<{ role: "user" | "assistant", content: string }>,
+ *   prospect_name: string,
+ *   prospect_email?: string,
+ *   language: "es" | "en"
+ * }
+ * Response: { ok: true, docId, outcome, prospectKey }
+ *
+ * NOTE: idempotency is enforced on the worker side via a per-call
+ * `submitted` flag — see ritual-agent/src/flows/qualification/index.ts.
+ * If a misbehaving caller invokes this twice, two timestamped docs
+ * land in Firestore. Acceptable for v1; revisit if it becomes noisy.
+ */
+export const extractQualification = onRequest(
+  {cors: true, timeoutSeconds: 120},
+  async (req, res) => {
+    interface TranscriptTurn {
+      role: "user" | "assistant";
+      content: string;
+    }
+    interface ExtractQualificationBody {
+      transcript: TranscriptTurn[];
+      prospect_name: string;
+      prospect_email?: string;
+      language: "es" | "en";
+    }
+    interface ExtractedPayload {
+      decision_taken: "Y" | "N" | "unknown";
+      behaviour_clarity: "clear" | "vague" | "unknown";
+      motivation_clarity: "clear" | "vague" | "unknown";
+      behaviour_to_change: string;
+      // Full grounded incident description (WHEN/WHERE/ACTIVITY/ACTION as
+      // a noun-phrase). Used as Phase 5b Step 1's moment-anchor in the
+      // Demo Call. See extraction prompt for the exact shape.
+      behaviour_example: string;
+      core_motivation: string;
+      problem_duration_self_reported: string;
+      life_stage_context: string;
+      symbolic_anchor_type:
+        | "religious"
+        | "philosophical"
+        | "esoteric"
+        | "hyper-rational"
+        | "none"
+        | "unknown";
+      symbolic_anchor_description: string;
+      alternatives_tried: string;
+      why_alternatives_failed: string;
+      alternatives_exhaustion_level: "low" | "medium" | "high" | "unknown";
+    }
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+
+      const body = req.body as ExtractQualificationBody;
+
+      if (!body.prospect_name || !body.language) {
+        res.status(400).json({error: "prospect_name and language required"});
+        return;
+      }
+      if (!Array.isArray(body.transcript) || body.transcript.length === 0) {
+        res.status(400).json({error: "transcript required (non-empty array)"});
+        return;
+      }
+
+      // Render the transcript as plain dialog for the extraction prompt.
+      // Speaker labels are language-aware so the LLM doesn't get confused
+      // about who said what when the conversation is in Spanish.
+      const speakerLabels = body.language === "es" ?
+        {user: "Prospecto", assistant: "Nova"} :
+        {user: "Prospect", assistant: "Nova"};
+      const renderedTranscript = body.transcript
+        .map((t) => `${speakerLabels[t.role]}: ${t.content}`)
+        .join("\n\n");
+
+      const filledPrompt = QUALIFICATION_EXTRACTION_PROMPT.replace(
+        "[INSERT TRANSCRIPT HERE]",
+        () => renderedTranscript
+      );
+
+      const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+      const model = gemini.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: {responseMimeType: "application/json"},
+      });
+
+      let extracted: ExtractedPayload;
+      try {
+        const result = await model.generateContent(filledPrompt);
+        const text = result.response.text();
+        extracted = JSON.parse(text) as ExtractedPayload;
+      } catch (err) {
+        logger.error("extractQualification: Gemini parse failed", err);
+        res.status(502).json({error: "extraction LLM failed"});
+        return;
+      }
+
+      // Outcome rubric — identical to submitQualification's. "unknown" on
+      // any gate field counts as a non-pass (conservative). This matters
+      // for: if the conversation ended abruptly (disconnect, idle), we
+      // don't want to mark someone "qualified" off a half-conversation.
+      const qualified =
+        extracted.decision_taken === "Y" &&
+        extracted.behaviour_clarity === "clear" &&
+        extracted.motivation_clarity === "clear";
+      const outcome: "qualified" | "disqualified" =
+        qualified ? "qualified" : "disqualified";
+
+      // prospectKey — same algorithm as submitQualification so /copilot's
+      // loadQualification (keyed on prospectKey ASC, createdAt DESC) keeps
+      // working without changes. Phone > email > name fallback chain.
+      const identityRaw =
+        body.prospect_email || body.prospect_name;
+      const prospectKey = identityRaw
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+
+      const db = getFirestore();
+      const docId = `${prospectKey}-${Date.now()}`;
+      await db.collection("qualifications").doc(docId).set({
+        ...extracted,
+        prospect_name: body.prospect_name,
+        contact_email: body.prospect_email ?? "",
+        language: body.language,
+        outcome,
+        qualified,
+        prospectKey,
+        source: "extractQualification",
+        // Persist the full conversation transcript alongside the extracted
+        // payload. The transcript was previously discarded after extraction,
+        // making backfills + future re-extractions impossible. Storing it
+        // here is the source-of-truth for any downstream need that wants
+        // the raw conversation (re-extraction with a new prompt, richer
+        // /copilot generations that consume source material directly, etc.).
+        transcript: body.transcript,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      // Mail dispatch via Firebase Trigger Email extension (A5).
+      // Skipped if the prospect didn't provide an email on the landing.
+      if (body.prospect_email) {
+        try {
+          const firstName =
+            body.prospect_name.split(/\s+/)[0] || body.prospect_name;
+          await db.collection("mail").add(
+            buildPostCallEmailDoc({
+              to: body.prospect_email,
+              language: body.language,
+              firstName,
+              extracted,
+            })
+          );
+        } catch (err) {
+          logger.error(
+            "extractQualification: mail dispatch failed (continuing)",
+            err
+          );
+          // Email is best-effort. Doc is already written; we don't fail
+          // the call on email failure.
+        }
+      } else {
+        logger.info(
+          "extractQualification: no prospect_email, skipping mail dispatch",
+          {prospectKey}
+        );
+      }
+
+      res.status(200).json({ok: true, docId, outcome, prospectKey});
+    } catch (err) {
+      logger.error("extractQualification failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);
+
+/**
+ * extractTrackingKpis (HTTP, CORS-enabled) — sister of extractQualification
+ * for the tracking-agent converse → extract redesign.
+ *
+ * tracking-agent no longer fires tools during the call. It walks through
+ * each behaviour conversationally; at end-of-call (endCall tool OR
+ * SIP participant disconnect OR idle handler OR hard wall-clock cap),
+ * the worker POSTs the full transcript here. This function:
+ *   1. Renders BEHAVIOURS + TRANSCRIPT into TRACKING_EXTRACTION_PROMPT.
+ *   2. Runs Gemini 2.5 Flash with responseMimeType: application/json.
+ *   3. Returns the populated TrackingState (Record<googleDocId, KpiBundle>)
+ *      back to the worker, which then POSTs it to tracking-workflow's
+ *      tracking-callback as the `ritualKpis` field.
+ *
+ * Unlike extractQualification this function does NOT write to Firestore
+ * and does NOT send any email — persistence lives in tracking-workflow's
+ * callback, mirroring the existing contract.
+ *
+ * Body: {
+ *   transcript: Array<{ role: "user" | "assistant", content: string }>,
+ *   rituals: Array<{ googleDocId: string, name: string }>,
+ *   language: "es" | "en"
+ * }
+ * Response: { ok: true, ritualKpis: Record<googleDocId, KpiBundle> }
+ */
+export const extractTrackingKpis = onRequest(
+  {cors: true, timeoutSeconds: 120},
+  async (req, res) => {
+    interface TranscriptTurn {
+      role: "user" | "assistant";
+      content: string;
+    }
+    interface RitualInput {
+      googleDocId: string;
+      name: string;
+    }
+    interface ExtractTrackingBody {
+      transcript: TranscriptTurn[];
+      rituals: RitualInput[];
+      language: "es" | "en";
+    }
+    interface KpiBundle {
+      relapse: boolean | null;
+      ritualFulfilled: boolean | null;
+      answeredCall: boolean | null;
+      ritualUsedOut: boolean;
+    }
+    type TrackingState = Record<string, KpiBundle>;
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+
+      const body = req.body as ExtractTrackingBody;
+
+      if (!body.language) {
+        res.status(400).json({error: "language required"});
+        return;
+      }
+      if (!Array.isArray(body.rituals) || body.rituals.length === 0) {
+        res.status(400).json({error: "rituals required (non-empty array)"});
+        return;
+      }
+      if (!Array.isArray(body.transcript) || body.transcript.length === 0) {
+        res.status(400).json({error: "transcript required (non-empty array)"});
+        return;
+      }
+
+      // Render the transcript with language-aware speaker labels so the
+      // extractor never has to guess who said what.
+      const speakerLabels = body.language === "es" ?
+        {user: "Usuario", assistant: "Agente"} :
+        {user: "User", assistant: "Agent"};
+      const renderedTranscript = body.transcript
+        .map((t) => `${speakerLabels[t.role]}: ${t.content}`)
+        .join("\n\n");
+
+      // Behaviours block — one line per ritual so the extractor can map
+      // user mentions back to the right googleDocId.
+      const renderedBehaviours = body.rituals
+        .map(
+          (r, i) =>
+            `  ${i + 1}. "${r.name}" (googleDocId: ${r.googleDocId})`
+        )
+        .join("\n");
+
+      const filledPrompt = TRACKING_EXTRACTION_PROMPT
+        .replace("[INSERT BEHAVIOURS HERE]", () => renderedBehaviours)
+        .replace("[INSERT TRANSCRIPT HERE]", () => renderedTranscript);
+
+      const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+      const model = gemini.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: {responseMimeType: "application/json"},
+      });
+
+      let extracted: TrackingState;
+      try {
+        const result = await model.generateContent(filledPrompt);
+        const text = result.response.text();
+        extracted = JSON.parse(text) as TrackingState;
+      } catch (err) {
+        logger.error("extractTrackingKpis: Gemini parse failed", err);
+        res.status(502).json({error: "extraction LLM failed"});
+        return;
+      }
+
+      // Defensive shape-check: ensure every requested ritual has a bundle
+      // in the output, with sensible defaults if the model omitted one.
+      // The downstream tracking-callback contract requires every ritual
+      // key to be present.
+      const ritualKpis: TrackingState = {};
+      for (const r of body.rituals) {
+        const raw = extracted[r.googleDocId];
+        ritualKpis[r.googleDocId] = {
+          relapse: typeof raw?.relapse === "boolean" ? raw.relapse : null,
+          ritualFulfilled:
+            typeof raw?.ritualFulfilled === "boolean" ?
+              raw.ritualFulfilled :
+              null,
+          answeredCall:
+            typeof raw?.answeredCall === "boolean" ? raw.answeredCall : null,
+          ritualUsedOut: raw?.ritualUsedOut === true,
+        };
+      }
+
+      res.status(200).json({ok: true, ritualKpis});
+    } catch (err) {
+      logger.error("extractTrackingKpis failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);
+
+/* eslint-disable max-len */
+/**
+ * Build the document for the Firebase Trigger Email extension. The
+ * extension watches the `mail/` collection and sends each doc via the
+ * configured SMTP (Gmail in our case).
+ *
+ * Visual register mirrors the in-call <VariablesPanel> on /qualify:
+ * editorial brand layout, small-caps Manrope-stack label, Fraunces-stack
+ * italic verbatim quote, gold ✦ next to the wordmark, generous vertical
+ * space. Table-based layout (not flexbox/grid) because email clients are
+ * inconsistent — Outlook in particular collapses non-table layouts. All
+ * styles are inline (no <style> block) so Outlook doesn't strip them.
+ * Web fonts aren't loadable in many email clients, so the stack falls
+ * back to system serif (Georgia) and system sans (Helvetica/Arial) —
+ * the visual register is preserved even without Fraunces/Manrope.
+ *
+ * max-len disabled for the body because inline HTML/CSS attributes and
+ * the bilingual copy strings are inherently long and read more clearly
+ * as single lines.
+ *
+ * @param {object} params Inputs for the email body.
+ * @param {string} params.to Recipient email address.
+ * @param {"es"|"en"} params.language Language of the email body.
+ * @param {string} params.firstName Recipient's first name for the greeting.
+ * @param {object} params.extracted The structured fields from the extraction
+ *   LLM. Empty strings for fields the conversation didn't surface.
+ * @return {object} A Firestore document for the `mail/` collection,
+ *   shaped for the Firebase Trigger Email extension.
+ */
+function buildPostCallEmailDoc(params: {
+  to: string;
+  language: "es" | "en";
+  firstName: string;
+  extracted: {
+    behaviour_to_change: string;
+    core_motivation: string;
+    problem_duration_self_reported: string;
+    life_stage_context: string;
+    symbolic_anchor_description: string;
+    alternatives_tried: string;
+    why_alternatives_failed: string;
+  };
+}): {
+  to: string;
+  replyTo: string;
+  message: {subject: string; text: string; html: string};
+} {
+  const {to, language, firstName, extracted} = params;
+
+  // ─── Copy ────────────────────────────────────────────────────────────────
+  // Label pairs mirror samwise-landing's <VariablesPanel>.
+  const labels = language === "es" ? {
+    behaviour_to_change: "El comportamiento",
+    core_motivation: "Por qué importa",
+    problem_duration_self_reported: "Cuánto lleva",
+    life_stage_context: "Dónde estás",
+    symbolic_anchor_description: "De dónde sacas fuerza",
+    alternatives_tried: "Lo que has intentado",
+    why_alternatives_failed: "Lo que faltó",
+  } : {
+    behaviour_to_change: "The behaviour",
+    core_motivation: "Why it matters",
+    problem_duration_self_reported: "How long",
+    life_stage_context: "Where you are",
+    symbolic_anchor_description: "What you draw on",
+    alternatives_tried: "What you've tried",
+    why_alternatives_failed: "What was missing",
+  };
+  const greeting = language === "es" ?
+    `Hola ${firstName},` :
+    `Hi ${firstName},`;
+  const intro = language === "es" ?
+    "Esto es lo que entendí de nuestra conversación. Si algo está mal o quieres aclararlo antes de la breakthrough call, responde a este email con tus correcciones." :
+    "Here's what I understood from our conversation. If anything is off or you want to clarify before the breakthrough call, just reply to this email with your corrections.";
+  const sign = language === "es" ?
+    "Gracias,\nSamuel" :
+    "Thanks,\nSamuel";
+  const subject = language === "es" ?
+    "Lo que entendí de nuestra llamada" :
+    "What I understood from our call";
+
+  // ─── Plain-text fallback ─────────────────────────────────────────────────
+  // Readable even in non-HTML mail clients. Curly quotes around values so
+  // the structure survives plain rendering.
+  const textRows: string[] = [];
+  for (const [key, label] of Object.entries(labels)) {
+    const value = (extracted as Record<string, string>)[key];
+    if (!value || value.trim().length === 0) continue;
+    textRows.push(`${label}\n“${value.trim()}”`);
+  }
+  const text = `${greeting}\n\n${intro}\n\n${textRows.join("\n\n")}\n\n${sign}`;
+
+  // ─── HTML body — table-based, inline-styled, email-client-safe ──────────
+  // Brand tokens (mirror /qualify's qualify.css):
+  //   --bg          #FFFFFF   --gold        #D4A85A
+  //   --ink         #000000   --ink-mute    #555555
+  // Stack: Georgia-as-Fraunces-fallback for the body type; Helvetica-as-
+  // Manrope-fallback for the labels. Web font @import deliberately omitted
+  // (unreliable across Outlook, Yahoo, K-9 Mail, etc.).
+
+  const variableCells = Object.entries(labels)
+    .map(([key, label]) => {
+      const value = (extracted as Record<string, string>)[key];
+      if (!value || value.trim().length === 0) return "";
+      return `
+        <tr><td style="padding: 0 0 36px 0;">
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+            <tr><td style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 500; font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: #555555; padding: 0 0 10px 0;">
+              ${escapeHtml(label)}
+            </td></tr>
+            <tr><td style="font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-weight: 400; font-size: 20px; line-height: 1.4; color: #000000;">
+              &ldquo;${escapeHtml(value.trim())}&rdquo;
+            </td></tr>
+          </table>
+        </td></tr>`;
+    })
+    .filter((s) => s.length > 0)
+    .join("");
+
+  const html = `<!doctype html>
+<html lang="${language}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(subject)}</title>
+</head>
+<body style="margin: 0; padding: 0; background: #FFFFFF; color: #000000;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background: #FFFFFF;">
+    <tr><td align="center" style="padding: 64px 24px 56px 24px;">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="560" style="max-width: 560px; width: 100%;">
+
+        <!-- Wordmark — Samwise + gold ✦, same DNA as canonical .qualify-brand -->
+        <tr><td style="padding: 0 0 56px 0;">
+          <span style="font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-weight: 400; font-size: 22px; letter-spacing: -0.01em; color: #000000;">Samwise</span><span style="color: #D4A85A; font-size: 9px; vertical-align: 12px; padding-left: 3px;">&#x2726;</span>
+        </td></tr>
+
+        <!-- Greeting -->
+        <tr><td style="font-family: Georgia, 'Times New Roman', serif; font-weight: 400; font-size: 17px; line-height: 1.5; color: #000000; padding: 0 0 18px 0;">
+          ${escapeHtml(greeting)}
+        </td></tr>
+
+        <!-- Intro -->
+        <tr><td style="font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-weight: 400; font-size: 16px; line-height: 1.55; color: #1A1A1A; padding: 0 0 48px 0;">
+          ${escapeHtml(intro)}
+        </td></tr>
+
+        <!-- Variable cards -->
+        ${variableCells}
+
+        <!-- Sign-off -->
+        <tr><td style="font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-weight: 400; font-size: 16px; line-height: 1.5; color: #000000; padding: 16px 0 0 0; white-space: pre-line;">
+          ${escapeHtml(sign)}
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  return {
+    to,
+    replyTo: "samuelgiraldoconcha@gmail.com",
+    message: {subject, text, html},
+  };
+}
+/* eslint-enable max-len */
+
+/**
+ * Minimal HTML-entity escaper for user-controlled strings rendered into
+ * the email HTML body. Not a general-purpose sanitizer — used only for
+ * the small set of fields the extraction LLM produces.
+ * @param {string} s The string to escape.
+ * @return {string} The HTML-escaped string.
+ */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}

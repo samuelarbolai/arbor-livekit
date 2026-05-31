@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@livekit/agents-plugin-google':
+    hash: c55470793c63f78cc467e999c55aa8e4cd96294d63df2561f7d166b37b9254e7
+    path: patches/@livekit__agents-plugin-google.patch
+
 importers:
 
   .:
@@ -19,16 +24,22 @@ importers:
         version: 1.2.8(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)
       '@livekit/agents-plugin-google':
         specifier: ~1.2.1
-        version: 1.2.8(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)
+        version: 1.2.8(patch_hash=c55470793c63f78cc467e999c55aa8e4cd96294d63df2561f7d166b37b9254e7)(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)
       '@livekit/agents-plugin-livekit':
         specifier: ^1.3.0
         version: 1.3.2(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))
+      '@livekit/agents-plugin-openai':
+        specifier: ^1.2.8
+        version: 1.2.8(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)(zod@3.25.76)
       '@livekit/agents-plugin-silero':
         specifier: ^1.3.0
         version: 1.3.2(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)
       '@livekit/noise-cancellation-node':
         specifier: ^0.1.9
         version: 0.1.9
+      '@livekit/rtc-node':
+        specifier: ^0.13.25
+        version: 0.13.27
       dotenv:
         specifier: ^17.4.1
         version: 17.4.2
@@ -592,6 +603,13 @@ packages:
     resolution: {integrity: sha512-Yb8qDBCqgSt02Wwgfn7KMTXwG3OmM/v8V2Lds5hNqnb2gMDstpWZuDQfeCw5Dp+AqoV5u36iVpsyCnxUsFpbjw==}
     peerDependencies:
       '@livekit/agents': 1.3.2
+
+  '@livekit/agents-plugin-openai@1.2.8':
+    resolution: {integrity: sha512-DF6javnyPG3m9H1eKNfKswrX4KMx4sQKDBwlOtruvInAmL9t7jPs731zviQjbQVR055DFZ/DrNEDqdb1eD/M5g==}
+    peerDependencies:
+      '@livekit/agents': 1.2.8
+      '@livekit/rtc-node': ^0.13.25
+      zod: ^3.25.76 || ^4.1.8
 
   '@livekit/agents-plugin-silero@1.3.2':
     resolution: {integrity: sha512-mRhOl0gxl8NRzFGHKly9/TCq0PcPDxjkhf5yKfF81yfDnAT0GVSazTekFk1l7MvrwsWYF2a/L+g2Q1U+4wahMw==}
@@ -2690,7 +2708,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@livekit/agents-plugin-google@1.2.8(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)':
+  '@livekit/agents-plugin-google@1.2.8(patch_hash=c55470793c63f78cc467e999c55aa8e4cd96294d63df2561f7d166b37b9254e7)(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)':
     dependencies:
       '@google/genai': 1.52.0
       '@livekit/agents': 1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76)
@@ -2710,6 +2728,18 @@ snapshots:
       '@huggingface/transformers': 3.7.2
       '@livekit/agents': 1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76)
       onnxruntime-node: 1.21.0
+
+  '@livekit/agents-plugin-openai@1.2.8(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)(zod@3.25.76)':
+    dependencies:
+      '@livekit/agents': 1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76)
+      '@livekit/mutex': 1.1.1
+      '@livekit/rtc-node': 0.13.27
+      openai: 6.8.1(ws@8.20.0)(zod@3.25.76)
+      ws: 8.20.0
+      zod: 3.25.76
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
 
   '@livekit/agents-plugin-silero@1.3.2(@livekit/agents@1.3.2(@livekit/rtc-node@0.13.27)(typescript@5.9.3)(zod@3.25.76))(@livekit/rtc-node@0.13.27)':
     dependencies:

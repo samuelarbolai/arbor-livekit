@@ -1,6 +1,5 @@
-import { type JobContext, llm, voice } from '@livekit/agents';
+import { llm, voice } from '@livekit/agents';
 import { TransformStream, type ReadableStream } from 'node:stream/web';
-import { z } from 'zod';
 
 // Strip parenthetical stage directions like "(pausa)", "[breath]", "*sighs*"
 // from the assistant's text before it reaches the TTS engine. Cartesia reads
@@ -37,11 +36,7 @@ function stripStageDirections(): TransformStream<string, string> {
 
 // Define a custom voice AI assistant by extending the base Agent class
 export class Agent extends voice.Agent {
-  constructor(
-    chatCtx: llm.ChatContext,
-    jobCtx: JobContext,
-    onVoicemailDetected: () => void,
-  ) {
+  constructor(chatCtx: llm.ChatContext) {
     super({
       chatCtx,
       instructions: `
@@ -109,22 +104,6 @@ export class Agent extends voice.Agent {
 <examples>
 </examples>
       `,
-      tools: {
-        leaveVoicemail: llm.tool({
-          description: `Call this tool exactly once, and only when you are confident the call has reached a voicemail or automated phone-menu system (e.g. "leave your message after the tone", "press 1 to listen, 2 to re-record", "you have reached the voicemail of..."). After calling it, stop speaking — do not call it again. Do NOT call this tool during a normal conversation with a human.`,
-          parameters: z.object({}),
-          execute: async () => {
-            try {
-              onVoicemailDetected();
-              jobCtx.shutdown('voicemail_detected');
-              return 'voicemail_acknowledged_shutting_down';
-            } catch (err) {
-              console.error('leaveVoicemail handler failed:', err);
-              return 'voicemail_acknowledged_with_warning';
-            }
-          },
-        }),
-      },
     });
   }
 

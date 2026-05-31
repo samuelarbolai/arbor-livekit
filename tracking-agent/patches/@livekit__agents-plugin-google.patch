@@ -1,0 +1,19 @@
+diff --git a/dist/llm.js b/dist/llm.js
+index 98cfbc991da705b1d0f7f57b158f90742c1eeb94..dd765d3dcc31ebc9b3b247486887d3ed8fe92664 100644
+--- a/dist/llm.js
++++ b/dist/llm.js
+@@ -379,6 +379,14 @@ class LLMStream extends llm.LLMStream {
+     }
+   }
+   #parsePart(id, part) {
++    // Drop Gemini thought-summary parts so they never reach TTS even
++    // if Google flips the includeThoughts default (or a future SDK
++    // change leaks them). Belt-and-suspenders to the includeThoughts:
++    // false config passed by callers. Observed 2026-05-27 leaking
++    // English chain-of-thought into Spanish calls.
++    if (part.thought) {
++      return null;
++    }
+     if (part.functionCall) {
+       return {
+         id,

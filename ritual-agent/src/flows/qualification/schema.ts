@@ -1,47 +1,63 @@
 import { z } from 'zod';
 
-// Schema for the Intake Agent's `gateDecision` tool.
-// Captures identifiers + P1 gates + safety gates.
-// Once these three gate fields are known, the Intake Agent calls
-// gateDecision, which routes the conversation:
-//   qualified   → handoff to Capture
-//   otherwise   → submit immediately, end the call
-export const GateDecisionSchema = z.object({
-  // Identifiers. prospect_name and language are collected on the
-  // landing's picker (before the conversation) and arrive via dispatch
-  // metadata — the LLM does NOT supply them through this tool, so they
-  // are optional here. The tool's `execute` merges them in from the
-  // captured meta before posting to the cloud function.
-  prospect_name: z.string().optional(),
-  contact_email: z.string().email().optional(),
-  contact_phone: z.string().optional(),
-  language: z.enum(['es', 'en']).optional(),
+// MIRROR of samwise-landing/lib/qualify/schema.ts — the landing-side file
+// is the source of truth. When you change one, change both.
+//
+// In the worker, agent.ts uses its own inline schemas for the setVariables
+// + endCall tools (kept inline because they're tightly coupled to the
+// tool's execute closures). The schemas here are kept in lockstep with
+// the landing for type-level parity and so any future code that needs to
+// parse a QualificationPayload (e.g., the extraction LLM's response on
+// the worker side) has a single zod source.
 
-  // Priority 1 — disqualification gates
-  decision_taken: z.enum(['Y', 'N']),
-  behaviour_clarity: z.enum(['clear', 'vague']),
-  motivation_clarity: z.enum(['clear', 'vague']),
-});
-
-export type GateDecisionPayload = z.infer<typeof GateDecisionSchema>;
-
-// Schema for the Capture Agent's `submitQualification` tool — and for
-// text-mode's single submit tool. Extends the gate schema with the
-// nine P2 (verbatim) fields. Field names mirror the Fit Assessment doc
-// and `samwise-app/app/copilot/demo-call-config.ts` so /copilot can
-// pre-fill key-for-key.
-export const QualificationPayloadSchema = GateDecisionSchema.extend({
+// ─── SetVariablesArgsSchema ────────────────────────────────────────────────
+// Input schema for the agent's `setVariables` tool. The seven user-facing
+// variables the agent commits as live notes during the conversation.
+// All fields optional in any single call.
+export const SetVariablesArgsSchema = z.object({
   behaviour_to_change: z.string().optional(),
   core_motivation: z.string().optional(),
   problem_duration_self_reported: z.string().optional(),
   life_stage_context: z.string().optional(),
+  symbolic_anchor_description: z.string().optional(),
+  alternatives_tried: z.string().optional(),
+  why_alternatives_failed: z.string().optional(),
+});
+
+export type SetVariablesArgs = z.infer<typeof SetVariablesArgsSchema>;
+
+// ─── EndCallArgsSchema ──────────────────────────────────────────────────────
+// Input schema for the agent's `endCall` tool — no arguments.
+export const EndCallArgsSchema = z.object({});
+
+// ─── QualificationPayloadSchema ────────────────────────────────────────────
+// The full structured payload produced by the extractQualification cloud
+// function from a conversation transcript.
+export const QualificationPayloadSchema = z.object({
+  prospect_name: z.string(),
+  contact_email: z.string().email().optional(),
+  contact_phone: z.string().optional(),
+  language: z.enum(['es', 'en']),
+
+  decision_taken: z.enum(['Y', 'N', 'unknown']),
+  behaviour_clarity: z.enum(['clear', 'vague', 'unknown']),
+  motivation_clarity: z.enum(['clear', 'vague', 'unknown']),
+
+  behaviour_to_change: z.string().optional(),
+  // Full grounded incident description (WHEN/WHERE/ACTIVITY/ACTION as a
+  // noun-phrase). Phase 5b Step 1 anchor in /copilot. Extracted post-call
+  // from the transcript — never live-committed during the conversation.
+  behaviour_example: z.string().optional(),
+  core_motivation: z.string().optional(),
+  problem_duration_self_reported: z.string().optional(),
+  life_stage_context: z.string().optional(),
   symbolic_anchor_type: z
-    .enum(['religious', 'philosophical', 'esoteric', 'hyper-rational', 'none'])
+    .enum(['religious', 'philosophical', 'esoteric', 'hyper-rational', 'none', 'unknown'])
     .optional(),
   symbolic_anchor_description: z.string().optional(),
   alternatives_tried: z.string().optional(),
   why_alternatives_failed: z.string().optional(),
-  alternatives_exhaustion_level: z.enum(['low', 'medium', 'high']).optional(),
+  alternatives_exhaustion_level: z.enum(['low', 'medium', 'high', 'unknown']).optional(),
 });
 
 export type QualificationPayload = z.infer<typeof QualificationPayloadSchema>;

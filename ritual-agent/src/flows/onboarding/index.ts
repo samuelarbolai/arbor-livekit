@@ -13,10 +13,7 @@ const LANGUAGE_NAME: Record<OnboardingMeta['language'], string> = {
   es: 'spanish',
 };
 
-export async function runOnboardingFlow(
-  ctx: JobContext,
-  meta: OnboardingMeta,
-): Promise<void> {
+export async function runOnboardingFlow(ctx: JobContext, meta: OnboardingMeta): Promise<void> {
   await ctx.connect();
 
   const voiceId = ONBOARDING_VOICE_ID_BY_LANGUAGE[meta.language];
@@ -27,9 +24,9 @@ export async function runOnboardingFlow(
     tts: makeTts(meta.language, voiceId),
     turnDetection: new livekit.turnDetector.MultilingualModel(),
     vad: ctx.proc.userData.vad! as silero.VAD,
-    voiceOptions: {
-      preemptiveGeneration: true,
-    },
+    // Top-level field (the `voiceOptions` wrapper is deprecated/flattened in
+    // @livekit/agents 1.2.0). ON is also the SDK default; kept explicit for clarity.
+    preemptiveGeneration: true,
   });
 
   attachIdleShutdown(ctx, session);
