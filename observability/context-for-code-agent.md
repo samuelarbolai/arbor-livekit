@@ -115,4 +115,14 @@ introduce a new LLM client or framework.
 
 ### Recent Changes
 
-- **(pending Phase 0)** Module created. See `current-plan.md` for phase status.
+- **2026-05-31 — Phase 1 base tracing shipped; per-call tagging OPEN.** `ritual-agent` exports base spans
+  to Langfuse (`src/config/tracing.ts`, `initTracing()` in `main.ts` prewarm, `applyConversationTracing()`
+  in the qualification flow). **Caveat:** the per-call tagging path is a silent no-op — `@livekit/agents`'s
+  `setTracerProvider(p, {metadata})` calls OTel **v1** `addSpanProcessor`, which the **v2** provider
+  (`@langfuse/otel` requires v2) removed → it threw and crashed every flow on entry; another session made
+  all tracing non-fatal (try/catch). So today traces reach Langfuse **ungrouped + untagged**. Fix (custom
+  v2 `SpanProcessor` or active root span) is deferred and must be **verified live before being written into
+  any skill**. The `samwise-livekit-agents` skill's "Langfuse tracing" section captures the verified crash
+  lesson; the tagging mechanism is intentionally left OPEN there.
+- For all Langfuse docs/API/CLI work use the generic `langfuse` skill (and its rule: never implement from
+  memory — verify against current docs). Phase 2's judge should follow its `judge-calibration.md`.

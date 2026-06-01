@@ -18,7 +18,7 @@ dotenv.config({ path: '.env.local' });
 // — `lk agent status` only tells you the active version's deploy time, not
 // which build handled a specific call (rollout can lag the build). See the
 // samwise-livekit-agents skill, "Confirming which build served a session".
-const BUILD_TAG = '2026-05-31-thinkbudget0-callhardcap';
+const BUILD_TAG = '2026-05-31-tracing-nonfatal';
 
 export default defineAgent({
   prewarm: async (proc: JobProcess) => {

@@ -4,17 +4,29 @@
 
 - ✅ **Phase 0 Step 2** — contract mirrored to `ritual-agent/src/config/observability.ts`; deps installed
   (`@langfuse/otel@5.4.1`, `@opentelemetry/sdk-trace-node@2.7.1`, `@opentelemetry/api@1.9.1`).
-- ✅ **Phase 1 code (qualification pilot)** — `config/tracing.ts` (lazy provider + Candidate A);
-  `main.ts` prewarm calls `initTracing()`; qualification flow calls `applyConversationTracing()`.
-  `vite build` clean; no type errors in changed files. Two impl notes learned:
-  (a) import telemetry via the `telemetry` namespace on `@livekit/agents` — there is NO `./telemetry`
-  subpath export; (b) `@langfuse/otel` (OTel SDK v2) vs `@livekit/agents` (SDK v1) is a nominal type
-  clash bridged with a cast — runtime-safe (shared `@opentelemetry/api`).
-- ⏳ **Phase 0 Step 1 + Phase 1 verification gate (USER)** — set `LANGFUSE_*` secrets on the agent;
-  take one `/qualify` call; confirm in Langfuse: session grouped by room name, per-turn spans, the
-  four tags + metadata. Concurrency check decides Candidate A vs B.
-- ⬜ Pending: propagate Phase 1 to `onboarding`/`call` (after A confirmed) · Phase 2 judge · Phase 3 wire ·
-  Phase 4 cockpit · Phase 5 seams.
+- ⚠️ **Phase 1 base tracing works; per-call TAGGING is broken (OPEN).** `config/tracing.ts` +
+  `main.ts` prewarm `initTracing()` + qualification `applyConversationTracing()` ship and build clean.
+  Base spans DO export to Langfuse. But the per-call tagging path is a **silent no-op** — see below.
+  Two impl notes that hold: (a) import telemetry via the `telemetry` **namespace** on `@livekit/agents`
+  (there is NO `./telemetry` subpath export).
+- 🐞 **CORRECTION to a prior claim.** The earlier "v1/v2 cast is runtime-safe" note was WRONG. Reality:
+  `@langfuse/otel` forces OTel SDK **v2**, but `@livekit/agents@1.2.0`'s `setTracerProvider(p, {metadata})`
+  calls the **v1** `p.addSpanProcessor()`, which v2 removed → it **threw and crashed every flow on entry**
+  (build `2026-05-31-thinkbudget0-callhardcap`). Another session correctly made all tracing calls
+  non-fatal (try/catch; build `2026-05-31-tracing-nonfatal`) — **do not revert that.** Net today:
+  the no-metadata `setTracerProvider(p)` (base spans) works; the `{metadata}` path throws + is swallowed,
+  so `langfuse.session.id` / tags / metadata never attach → traces are **ungrouped + untagged.**
+- ⛔ **OPEN — tagging fix (do NOT start until told; do NOT encode in any skill until verified live).**
+  Options: a v2-native custom `SpanProcessor` added at construction reading a per-job ref (faithful port
+  of LiveKit's `MetadataSpanProcessor`), or Candidate B (active root span). Verify tags land in a live
+  Langfuse session BEFORE writing the mechanism into `samwise-livekit-agents`.
+- ⏳ **Phase 0 Step 1 (USER)** — set `LANGFUSE_*` secrets on the deployed agent (`.env.local` already has
+  them for local `pnpm dev`). Deploy is safe without (tracer no-ops).
+- ⬜ Pending: fix tagging (above) → re-verify → propagate to `onboarding`/`call` · **Phase 2 judge — build
+  it around the `langfuse` skill's `judge-calibration.md` (dataset experiment; `POST /api/public/scores`,
+  not the cli)** · Phase 3 wire · Phase 4 cockpit · Phase 5 seams.
+- 🔒 **Open concern — PII/masking.** We will ship full mental-health transcripts to Langfuse Cloud. Decide
+  retention / masking / access before this runs on real prospects (the `langfuse` skill's baseline flags it).
 
 ## Plan Summary
 

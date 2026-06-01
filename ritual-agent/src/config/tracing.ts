@@ -23,7 +23,7 @@
 import { telemetry } from '@livekit/agents';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { buildLangfuseAttributes, type ObsMeta } from './observability';
+import { type ObsMeta } from './observability';
 
 // @livekit/agents bundles OpenTelemetry SDK v1 types; @langfuse/otel requires
 // SDK v2 (see memory reference-langfuse-nextjs-setup). The clash is NOMINAL
@@ -54,13 +54,26 @@ function ensureProvider(): NodeTracerProvider {
     console.warn('[tracing] LANGFUSE_* not fully set — conversation tracing disabled');
   }
   provider = new NodeTracerProvider({ spanProcessors });
-  telemetry.setTracerProvider(provider as unknown as LkTracerProvider);
+  // Observability must NEVER crash the agent. @livekit/agents 1.2.0's
+  // setTracerProvider() uses the OTel **v1** `provider.addSpanProcessor()`
+  // when given metadata; a mismatched provider version throws here. Swallow it
+  // — a broken tracer cannot be allowed to kill the worker's entry (it did:
+  // every flow crashed on entry on build 2026-05-31-thinkbudget0-callhardcap).
+  try {
+    telemetry.setTracerProvider(provider as unknown as LkTracerProvider);
+  } catch (err) {
+    console.warn('[tracing] setTracerProvider failed (non-fatal) — tracing disabled', err);
+  }
   return provider;
 }
 
 /** Phase 1 Step 1 — register the provider at worker boot (call from prewarm). */
 export function initTracing(): void {
-  ensureProvider();
+  try {
+    ensureProvider();
+  } catch (err) {
+    console.warn('[tracing] initTracing failed (non-fatal)', err);
+  }
 }
 
 /**
@@ -75,8 +88,20 @@ export function initTracing(): void {
  * approach documented in observability/current-plan.md (Phase 1 Step 2,
  * Candidate B).
  */
-export function applyConversationTracing(meta: ObsMeta): void {
-  telemetry.setTracerProvider(ensureProvider() as unknown as LkTracerProvider, {
-    metadata: buildLangfuseAttributes(meta),
-  });
+export function applyConversationTracing(_meta: ObsMeta): void {
+  // Per-call tagging (langfuse.session.id + flow/lang/variant tags) is an OPEN
+  // item — see the samwise-livekit-agents skill, "Langfuse tracing … v1/v2 split".
+  // @livekit/agents 1.2.0 only attaches metadata via
+  // setTracerProvider(provider, { metadata }), which calls the OTel **v1**
+  // `addSpanProcessor` — removed in our v2 provider, so it throws and kills the
+  // flow's entry (it shipped once and crashed every flow). Rule 2: do NOT pass
+  // metadata to a v2 provider. Base spans still reach Langfuse (ungrouped /
+  // untagged) via the provider registered in ensureProvider(); a v2-native
+  // tagging mechanism must be VERIFIED live in Langfuse before it's wired in.
+  // For now, just guarantee the provider is initialized.
+  try {
+    ensureProvider();
+  } catch (err) {
+    console.warn('[tracing] applyConversationTracing failed (non-fatal)', err);
+  }
 }
