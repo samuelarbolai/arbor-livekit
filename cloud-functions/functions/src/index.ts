@@ -466,6 +466,14 @@ const QUALIFICATION_EXTRACTION_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
+// Extraction prompt used by extractQualificationTherapist — the therapist
+// audience's mirror. Reads a Nova ↔ therapist transcript and emits the four
+// therapist variables as JSON.
+const QUALIFICATION_THERAPIST_EXTRACTION_PROMPT = fs.readFileSync(
+  path.join(__dirname, "extraction_qualification_therapist_prompt.txt"),
+  "utf-8"
+);
+
 // Extraction prompt used by extractTrackingKpis. Same loading pattern.
 // Reads a tracking-call transcript (tracking-agent ↔ user) and emits a
 // TrackingState JSON object — one KpiBundle per ritual, keyed by
@@ -644,17 +652,95 @@ export const registerNewRitual = onRequest((req, res) => {
       }
       const documentId = docIdMatch[1];
 
-      // Read the Google Doc content
+      // Read the Google Doc via the Docs API with includeTabsContent. We
+      // need TWO views of the same Doc:
+      //   - METADATA TEXT (`docContent`): the text from which the five
+      //     required Metadata keys are regex-parsed. Sourced from the
+      //     "Metadata" tab; falls back to the whole-Doc body if that tab is
+      //     missing (legacy untabbed Docs).
+      //   - SYNTHESIS TEXT (`synthesisText`): the text passed to Gemini as
+      //     the raw material the synthesis prompt fills the XML template
+      //     from. Sourced from the "Behavioural picture" + "Ritual" +
+      //     "Ritual Call" tabs concatenated; falls back to the whole-Doc
+      //     body if any of those tabs are missing.
+      //
+      // The fallback path logs a BIG warning. Untabbed Docs (or Docs whose
+      // therapist forgot to name a tab correctly) leak ALL tabs to Gemini —
+      // including any "Ejemplo de ritual" example or "Possible origins"
+      // biographical material — which risks splicing the example user's
+      // name/phone or another user's trauma into the synthesized output.
+      // S4 is the deterministic isolation; the fallback is backstop only.
+      const SYNTHESIS_TAB_TITLES = [
+        "Behavioural picture",
+        "Ritual",
+        "Ritual Call",
+      ];
+      const METADATA_TAB_TITLE = "Metadata";
       let docContent = "";
+      let synthesisText = "";
       try {
-        const exportUrl = `https://docs.google.com/document/d/${documentId}/export?format=txt`;
-        const response = await fetch(exportUrl);
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+        const docs = getDocsClient();
+        const doc = await docs.documents.get({
+          documentId,
+          includeTabsContent: true,
+        });
+        const tabs = doc.data.tabs;
+        // Whole-Doc fallback: concatenate text from EVERY tab (recursive over
+        // childTabs). `doc.data.body` is intentionally EMPTY when the Docs
+        // API is called with `includeTabsContent: true` (the API moves all
+        // content into `tabs`), so the legacy `body.content` path returns
+        // "" for any tabbed Doc. Walking the tabs is the right "everything"
+        // fallback for both tabbed and legacy single-tab Docs.
+        const wholeDocFallback = (): string => {
+          const chunks: string[] = [];
+          const walk = (list: typeof tabs) => {
+            if (!list) return;
+            for (const t of list) {
+              chunks.push(flattenDocToText(t.documentTab?.body?.content ?? []));
+              walk(t.childTabs as typeof tabs);
+            }
+          };
+          walk(tabs);
+          return chunks.join("\n\n");
+        };
+
+        // Synthesis side.
+        const synth = extractTabsAsText(tabs, SYNTHESIS_TAB_TITLES);
+        if (synth.missing.length === 0) {
+          synthesisText = SYNTHESIS_TAB_TITLES
+            .map((t) => `# ${t}\n\n${synth.found.get(t) ?? ""}`)
+            .join("\n\n");
+        } else {
+          logger.warn(
+            "==================================================================\n" +
+            "REGISTER_NEW_RITUAL: SYNTHESIS-FEEDABLE TABS MISSING.\n" +
+            `Doc ${documentId} is missing tab(s): ` +
+            `${synth.missing.join(", ")}.\n` +
+            "Falling back to whole-Doc content. The synthesis prompt will\n" +
+            "see EVERY tab in the Doc, including any 'Ejemplo de ritual'\n" +
+            "example and any biographical 'Lapse Map' / 'Possible origins'\n" +
+            "material. This risks leaking another user's name, phone\n" +
+            "number, or trauma into the synthesized userInputs.\n" +
+            "Fix the Doc: ensure tabs named exactly 'Behavioural picture',\n" +
+            "'Ritual', and 'Ritual Call' exist at the top level.\n" +
+            "=================================================================="
+          );
+          synthesisText = wholeDocFallback();
         }
-        docContent = await response.text();
+
+        // Metadata side.
+        const metadataResult = extractTabsAsText(tabs, [METADATA_TAB_TITLE]);
+        if (metadataResult.missing.length === 0) {
+          docContent = metadataResult.found.get(METADATA_TAB_TITLE) ?? "";
+        } else {
+          logger.warn(
+            `REGISTER_NEW_RITUAL: '${METADATA_TAB_TITLE}' tab missing from ` +
+            `Doc ${documentId}; parsing metadata keys from whole-Doc.`
+          );
+          docContent = wholeDocFallback();
+        }
       } catch (error) {
-        logger.error("Failed to read Google Doc via export link:", error);
+        logger.error("Failed to read Google Doc via Docs API:", error);
         res.status(500).send({error: "Failed to read Google Doc."});
         return;
       }
@@ -741,8 +827,11 @@ export const registerNewRitual = onRequest((req, res) => {
       // Inject the metadata language as an explicit statement at the end
       // of the raw material — matches the worked example's pattern so the
       // synthesis prompt's Rule 1 treats it as the canonical call language.
+      // Source is `synthesisText` (the three synthesis tabs concatenated,
+      // or whole-Doc on fallback) — NOT `docContent` (which only carries
+      // the Metadata tab text used for key regex parsing).
       const enrichedDocContent =
-        `${docContent}\n\n` +
+        `${synthesisText}\n\n` +
         "[NOTE: The user has separately specified they want the call " +
         `conducted entirely in ${meta.language}.]`;
 
@@ -1219,6 +1308,56 @@ function flattenDocToText(content: Array<unknown>): string {
     }
   }
   return lines.join("");
+}
+
+/**
+ * extractTabsAsText
+ *
+ * Walks a Google Docs API `tabs` array (and any nested `childTabs`) and
+ * returns the flattened plain text of each tab whose title matches one of
+ * `wantedTitles`. Match is exact (titles are trimmed). First match per title
+ * wins — duplicate-titled tabs after the first are ignored.
+ *
+ * Used by `registerNewRitual` to isolate the synthesis-feedable tabs
+ * ("Behavioural picture", "Ritual", "Ritual Call") from scratch / example
+ * tabs ("Lapse Map", "Possible origins", "Ejemplo de ritual") in the same
+ * Doc. The Doc's "Metadata" tab is extracted the same way for key parsing.
+ *
+ * @param {Array} tabs The `doc.data.tabs` array from `docs.documents.get`
+ *   called with `includeTabsContent: true`. May be `undefined` / `null` /
+ *   empty (legacy Docs without the tabs feature).
+ * @param {string[]} wantedTitles Tab titles to extract.
+ * @return {{found: Map<string, string>, missing: string[]}} `found` maps
+ *   each matched title to its flattened text. `missing` lists requested
+ *   titles that were not found anywhere in the tab tree.
+ */
+function extractTabsAsText(
+  tabs:
+    | Array<{
+        tabProperties?: {title?: string | null} | null;
+        documentTab?: {body?: {content?: Array<unknown>}} | null;
+        childTabs?: Array<unknown>;
+      }>
+    | undefined
+    | null,
+  wantedTitles: string[]
+): {found: Map<string, string>; missing: string[]} {
+  const found = new Map<string, string>();
+  const wanted = new Set(wantedTitles);
+  const walk = (list: typeof tabs) => {
+    if (!list) return;
+    for (const t of list) {
+      const title = t.tabProperties?.title?.trim();
+      if (title && wanted.has(title) && !found.has(title)) {
+        const text = flattenDocToText(t.documentTab?.body?.content ?? []);
+        found.set(title, text);
+      }
+      walk(t.childTabs as typeof tabs);
+    }
+  };
+  walk(tabs);
+  const missing = wantedTitles.filter((w) => !found.has(w));
+  return {found, missing};
 }
 
 /* eslint-disable max-len */
@@ -1926,6 +2065,226 @@ export const appendDemoCallRow = onRequest(
 );
 
 // =============================================================================
+// extractDemoCall — UNIFIED demo-call persistence (replaces appendDemoCallRow)
+// =============================================================================
+// One canonical write path for the Demo Call, used by BOTH:
+//   - the autonomous demo-call agent (ritual-agent flows/demo-call): POSTs the
+//     full transcript + its live-captured state → we re-extract the variable
+//     set with Gemini (the more complete record), keep the agent's in-call
+//     judgments authoritative, and store the transcript for backfill.
+//   - the human /copilot "Save call" button (rep_state mode): same shape the
+//     old appendDemoCallRow wrote — kept working so the migration is a no-risk
+//     swap of the URL on the client.
+// Always writes the SAME demoCalls/{prospectKey}-{ts} doc shape (raw, cleaned,
+// prospectKey, repName, outcome, createdAt) so downstream readers don't change.
+//
+// NOTE: DEMO_EXTRACTION_PROMPT below is a v1 — solid coverage of the variable
+// set, but the per-variable extraction nuance (self-talk verbatim, the
+// view-of-life correction signal, the fit_state read) should be refined against
+// real transcripts + the samwise-script-work / synthesis-prompt rules before we
+// lean on it for analytics.
+/* eslint-disable max-len */
+const DEMO_EXTRACTION_PROMPT = `You are extracting structured data from a transcript of a Samwise "Demo Call" — a ~50-minute Spanish-language diagnostic + sales call between a rep ("Asesora") and a prospect ("Prospecto"). Read the full transcript and output a SINGLE JSON object with EXACTLY the keys listed below. Use "" for anything genuinely not covered in the transcript. Output values in the prospect's own language. Do NOT invent content that is not in the transcript.
+
+RULES:
+- Preserve the prospect's own words and metaphors. Do NOT relabel their problem with clinical terms (never "adicción", "depresión", "ansiedad", "TDAH", "trauma"). This is data, not a diagnosis.
+- self_talk_after_relapse: VERBATIM — the prospect's exact words about what they say to themselves after a setback, in their language. Do not paraphrase, translate, or clean it.
+- For the judgment/select fields, use ONLY one of the listed options.
+
+KEYS:
+- referral (string): why they came / who recommended them.
+- expectation (string): what they said they expect from the program, in their words.
+- feelings_during_relapse (string): what they felt in the moment, their words.
+- intention_behind_action (string): what the part of them that acted was trying to do for them (escape, soothe, seek) — surfaced via the rep's reframe.
+- thoughts_during_relapse (string): what went through their head in the moment.
+- self_talk_after_relapse (string): VERBATIM quote of what they tell themselves afterward.
+- view_of_their_life_in_that_moment (string): how they see their life or themselves in that moment; preserve the emotional charge, do not soften.
+- consequences_for_them (string): the cost in their life — relationships, work, health, dignity.
+- grado_de_identificacion (one of: "low" | "medium" | "high" | ""): how identified the prospect is with the problem. Best signal: how precisely they corrected the rep's synthesis of their view-of-life (a precise correction = high; bland acceptance = low).
+- biologic_symbolic_analogy (one of: "flu" | "cold" | "allergy" | "diabetes" | "cancer" | "other" | ""): the illness analogy used to build the desidentification frame.
+- clinical_picture_description (string): the short externalised description used in the prospect's mantra ("Estoy enfermo con ___") — phrased as something they HAVE, in their voice.
+- fit_state (one of: "qualified" | "still_disqualified"): after the desidentification work, did the prospect see THEMSELVES in the problem now (qualified) or see the value but as valid for someone else (still_disqualified)? Default "qualified" if the call closed normally and the prospect engaged with the frame as their own.
+- time_spent_in_alternatives (string): how long they have spent on prior solutions.
+- total_money_spent_in_alternatives (string): rough total they have spent on prior solutions.
+- monthly_budget_willingness (string): what they would be willing to invest monthly.
+- outcome (one of: "closed" | "follow-up" | "disqualified" | "no" | ""): how the call ended.
+- next_step (string): the concrete next action agreed.
+- rep_notes (string): anything notable for the clinician handoff. Include any referral names surfaced in the rebound, with the prospect's connection to each.
+
+TRANSCRIPT:
+[INSERT TRANSCRIPT HERE]`;
+/* eslint-enable max-len */
+
+/**
+ * extractDemoCall (HTTP, CORS-enabled). See the section comment above.
+ * Body (transcript mode): { mode?: "transcript", transcript, liveState?,
+ *   prospect_name?, prospect_email?, language? }.
+ * Body (rep_state mode):  { mode: "rep_state", raw?, cleaned,
+ *   qualificationProspectKey? }.
+ * Response: { ok: true, docId, prospectKey }.
+ */
+export const extractDemoCall = onRequest(
+  {cors: true, timeoutSeconds: 120},
+  async (req, res) => {
+    interface TranscriptTurn {
+      role: "user" | "assistant";
+      content: string;
+    }
+    interface ExtractDemoBody {
+      mode?: "transcript" | "rep_state";
+      // transcript mode (agent / any transcribed demo)
+      transcript?: TranscriptTurn[];
+      liveState?: Record<string, string>;
+      prospect_name?: string;
+      prospect_email?: string;
+      language?: "es" | "en";
+      // rep_state mode (human /copilot Save button — migrated from
+      // appendDemoCallRow)
+      raw?: Record<string, string>;
+      cleaned?: Record<string, string>;
+      qualificationProspectKey?: string;
+    }
+
+    /**
+     * prospectKey from a raw identity string — same algorithm as
+     * appendDemoCallRow / extractQualification so lookups stay stable.
+     * @param {string} identity Email or name.
+     * @return {string} Normalized prospect key.
+     */
+    function toProspectKey(identity: string): string {
+      return identity
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+    }
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+      const body = req.body as ExtractDemoBody;
+      const db = getFirestore();
+
+      // ── rep_state mode: identical contract to the old appendDemoCallRow ──
+      if (
+        body.mode === "rep_state" ||
+        (!body.mode && body.cleaned && !body.transcript)
+      ) {
+        const cleaned = body.cleaned ?? {};
+        const raw = body.raw ?? {};
+        const prospectName = (cleaned.prospect_name ?? "").trim();
+        if (!prospectName && !body.qualificationProspectKey) {
+          res.status(400).json({
+            error: "prospect_name or qualificationProspectKey required",
+          });
+          return;
+        }
+        const prospectKey =
+          body.qualificationProspectKey || toProspectKey(prospectName);
+        const docId = `${prospectKey}-${Date.now()}`;
+        await db.collection("demoCalls").doc(docId).set({
+          raw,
+          cleaned,
+          prospectKey,
+          repName: cleaned.rep_name ?? "",
+          outcome: cleaned.outcome ?? "",
+          source: "rep_state",
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        res.status(200).json({ok: true, docId, prospectKey});
+        return;
+      }
+
+      // ── transcript mode: agent (or any transcribed demo) ──
+      const transcript = body.transcript;
+      const language = body.language ?? "es";
+      const liveState = body.liveState ?? {};
+      const prospectName = (
+        body.prospect_name ?? liveState.prospect_name ?? ""
+      ).trim();
+      if (!Array.isArray(transcript) || transcript.length === 0) {
+        res.status(400).json({error: "transcript required (non-empty array)"});
+        return;
+      }
+
+      const speakerLabels = language === "es" ?
+        {user: "Prospecto", assistant: "Asesora"} :
+        {user: "Prospect", assistant: "Advisor"};
+      const rendered = transcript
+        .map((t) => `${speakerLabels[t.role]}: ${t.content}`)
+        .join("\n\n");
+      const filledPrompt = DEMO_EXTRACTION_PROMPT.replace(
+        "[INSERT TRANSCRIPT HERE]",
+        () => rendered
+      );
+
+      const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+      const model = gemini.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: {responseMimeType: "application/json"},
+      });
+
+      let extracted: Record<string, string> = {};
+      try {
+        const result = await model.generateContent(filledPrompt);
+        const text = result.response.text();
+        extracted = JSON.parse(text) as Record<string, string>;
+      } catch (err) {
+        // Don't lose the call — fall back to the agent's live state.
+        logger.error("extractDemoCall: extraction failed", err);
+        extracted = {};
+      }
+
+      // Merge: the transcript extraction is the more complete record, but
+      // the agent's in-call JUDGMENTS (fit_state, grado_de_identificacion)
+      // drove the actual call, so they stay authoritative. liveState
+      // backfills anything the extractor left blank.
+      const extractedNonEmpty = Object.fromEntries(
+        Object.entries(extracted).filter(
+          ([, v]) => typeof v === "string" && v.trim().length > 0
+        )
+      );
+      const cleaned: Record<string, string> = {
+        ...liveState,
+        ...extractedNonEmpty,
+      };
+      for (const k of ["fit_state", "grado_de_identificacion"]) {
+        if (liveState[k]) cleaned[k] = liveState[k];
+      }
+      if (prospectName) cleaned.prospect_name = prospectName;
+
+      const identityRaw =
+        body.prospect_email || prospectName || liveState.prospect_name || "";
+      const prospectKey = toProspectKey(identityRaw);
+      const docId = `${prospectKey}-${Date.now()}`;
+      await db.collection("demoCalls").doc(docId).set({
+        raw: liveState,
+        cleaned,
+        prospectKey,
+        repName: liveState.rep_name ?? "Samwise Agent",
+        outcome: cleaned.outcome ?? "",
+        contact_email: body.prospect_email ?? "",
+        language,
+        source: "extractDemoCall",
+        transcript,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      res.status(200).json({
+        ok: true,
+        docId,
+        prospectKey,
+        fit_state: cleaned.fit_state ?? "",
+      });
+    } catch (err) {
+      logger.error("extractDemoCall failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);
+
+// =============================================================================
 // Qualification Agent (web first-touch Fit Assessment)
 // =============================================================================
 // Two functions back the qualification agent that lives at
@@ -1978,6 +2337,7 @@ export const submitQualification = onRequest(
       core_motivation?: string;
       problem_duration_self_reported?: string;
       life_stage_context?: string;
+      /*
       symbolic_anchor_type?:
         | "religious"
         | "philosophical"
@@ -1988,6 +2348,7 @@ export const submitQualification = onRequest(
       alternatives_tried?: string;
       why_alternatives_failed?: string;
       alternatives_exhaustion_level?: "low" | "medium" | "high";
+      */
     }
 
     try {
@@ -2158,6 +2519,7 @@ export const extractQualification = onRequest(
       core_motivation: string;
       problem_duration_self_reported: string;
       life_stage_context: string;
+      /*
       symbolic_anchor_type:
         | "religious"
         | "philosophical"
@@ -2169,6 +2531,7 @@ export const extractQualification = onRequest(
       alternatives_tried: string;
       why_alternatives_failed: string;
       alternatives_exhaustion_level: "low" | "medium" | "high" | "unknown";
+      */
     }
 
     try {
@@ -2294,6 +2657,136 @@ export const extractQualification = onRequest(
       res.status(200).json({ok: true, docId, outcome, prospectKey});
     } catch (err) {
       logger.error("extractQualification failed", err);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({error: message});
+    }
+  }
+);
+
+/**
+ * extractQualificationTherapist (HTTP, CORS-enabled) — the THERAPIST mirror of
+ * extractQualification. The therapist qualification flow (in ritual-agent's
+ * flows/qualification-therapist/) just converses and asks the four questions;
+ * at end-of-call the worker POSTs the transcript here. This function:
+ *   1. Runs Gemini 2.5 Flash with the therapist extraction prompt to turn the
+ *      transcript into the four-field therapist payload.
+ *   2. Always returns outcome "qualified" — the therapist call has NO gate
+ *      (every therapist who answers is invited to book the 50-min demo).
+ *   3. Writes qualifications/{prospectKey}-{ts} (same collection + identity
+ *      chain as extractQualification, tagged audience: "therapist").
+ *
+ * Body + response shape are identical to extractQualification, so the worker's
+ * submit path is byte-identical.
+ */
+export const extractQualificationTherapist = onRequest(
+  {cors: true, timeoutSeconds: 120},
+  async (req, res) => {
+    interface TranscriptTurn {
+      role: "user" | "assistant";
+      content: string;
+    }
+    interface ExtractQualificationTherapistBody {
+      transcript: TranscriptTurn[];
+      prospect_name: string;
+      prospect_email?: string;
+      language: "es" | "en";
+    }
+    interface ExtractedPayload {
+      patient_addiction_type: string;
+      last_patient_occurrence: string;
+      helped_patient_attempts: string;
+      why_attempts_failed: string;
+    }
+
+    try {
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method Not Allowed"});
+        return;
+      }
+
+      const body = req.body as ExtractQualificationTherapistBody;
+      if (!body.prospect_name || !body.language) {
+        res.status(400).json({error: "prospect_name and language required"});
+        return;
+      }
+      if (!Array.isArray(body.transcript) || body.transcript.length === 0) {
+        res.status(400).json({error: "transcript required (non-empty array)"});
+        return;
+      }
+
+      const speakerLabels = body.language === "es" ?
+        {user: "Terapeuta", assistant: "Nova"} :
+        {user: "Therapist", assistant: "Nova"};
+      const renderedTranscript = body.transcript
+        .map((t) => `${speakerLabels[t.role]}: ${t.content}`)
+        .join("\n\n");
+
+      const filledPrompt = QUALIFICATION_THERAPIST_EXTRACTION_PROMPT.replace(
+        "[INSERT TRANSCRIPT HERE]",
+        () => renderedTranscript
+      );
+
+      const gemini = new GoogleGenerativeAI(requireEnv("GEMINI_KEY"));
+      const model = gemini.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        generationConfig: {responseMimeType: "application/json"},
+      });
+
+      let extracted: ExtractedPayload;
+      try {
+        const result = await model.generateContent(filledPrompt);
+        const text = result.response.text();
+        extracted = JSON.parse(text) as ExtractedPayload;
+      } catch (err) {
+        logger.error("extractQualificationTherapist: Gemini parse failed", err);
+        res.status(502).json({error: "extraction LLM failed"});
+        return;
+      }
+
+      // No gate — every therapist who answers is invited to book the
+      // 50-minute demo. Always qualified.
+      const outcome: "qualified" | "disqualified" = "qualified";
+
+      // prospectKey — same algorithm as extractQualification so /copilot's
+      // loadQualification (keyed on prospectKey ASC, createdAt DESC) keeps
+      // working without changes. Phone > email > name fallback chain.
+      const identityRaw = body.prospect_email || body.prospect_name;
+      const prospectKey = identityRaw
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+
+      const db = getFirestore();
+      const docId = `${prospectKey}-${Date.now()}`;
+      await db.collection("qualifications").doc(docId).set({
+        ...extracted,
+        audience: "therapist",
+        prospect_name: body.prospect_name,
+        contact_email: body.prospect_email ?? "",
+        language: body.language,
+        outcome,
+        qualified: true,
+        prospectKey,
+        source: "extractQualificationTherapist",
+        // Persist the full conversation transcript alongside the extracted
+        // payload (same rationale as extractQualification — re-extraction
+        // with a new prompt becomes possible).
+        transcript: body.transcript,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      // NOTE: extractQualification dispatches a post-call confirmation email
+      // here via the Firebase Trigger Email extension (buildPostCallEmailDoc).
+      // Intentionally omitted for the therapist flow until we decide on the
+      // therapist confirmation copy (the FinalScreen booking link already
+      // takes the therapist into /book?type=therapist-demo, which has its
+      // own confirmation email; a second "thanks for the call" email here
+      // would be duplicative). Add a buildTherapistConfirmationEmailDoc and
+      // dispatch here if we decide to send one.
+
+      res.status(200).json({ok: true, docId, outcome, prospectKey});
+    } catch (err) {
+      logger.error("extractQualificationTherapist failed", err);
       const message = err instanceof Error ? err.message : String(err);
       res.status(500).json({error: message});
     }
@@ -2475,9 +2968,11 @@ function buildPostCallEmailDoc(params: {
     core_motivation: string;
     problem_duration_self_reported: string;
     life_stage_context: string;
+    /*
     symbolic_anchor_description: string;
     alternatives_tried: string;
     why_alternatives_failed: string;
+    */
   };
 }): {
   to: string;
@@ -2493,17 +2988,21 @@ function buildPostCallEmailDoc(params: {
     core_motivation: "Por qué importa",
     problem_duration_self_reported: "Cuánto lleva",
     life_stage_context: "Dónde estás",
+    /*
     symbolic_anchor_description: "De dónde sacas fuerza",
     alternatives_tried: "Lo que has intentado",
     why_alternatives_failed: "Lo que faltó",
+    */
   } : {
     behaviour_to_change: "The behaviour",
     core_motivation: "Why it matters",
     problem_duration_self_reported: "How long",
     life_stage_context: "Where you are",
+    /*
     symbolic_anchor_description: "What you draw on",
     alternatives_tried: "What you've tried",
     why_alternatives_failed: "What was missing",
+    */
   };
   const greeting = language === "es" ?
     `Hola ${firstName},` :

@@ -10,18 +10,19 @@ import {
   makeTts,
 } from '../../config/providers';
 import { QUALIFICATION_VOICE_ID_BY_LANGUAGE } from '../../config/voiceIds';
-import { type QualificationMeta } from '../../types/metadata';
+import { type QualificationTherapistMeta } from '../../types/metadata';
 import { attachIdleShutdown } from '../onboarding/idleHandler';
-import { QualificationAgent } from './agent';
-import { attachStallRecovery } from './stallRecovery';
+import { attachStallRecovery } from '../qualification/stallRecovery';
+import { TherapistQualificationAgent } from './agent';
 
-const EXTRACT_QUALIFICATION_URL = process.env.EXTRACT_QUALIFICATION_URL;
+const EXTRACT_QUALIFICATION_THERAPIST_URL =
+  process.env.EXTRACT_QUALIFICATION_THERAPIST_URL;
 
 // Lifecycle (single-agent + agent/scribe split):
-//   1. Worker accepts a dispatch with metadata { flow: 'qualification',
+//   1. Worker accepts a dispatch with metadata { flow: 'qualification-therapist',
 //      language, prospect_name, prospect_email? }.
 //   2. We connect to the room, build the AgentSession, and start the
-//      QualificationAgent (one agent for the entire call, one prompt,
+//      TherapistQualificationAgent (one agent for the entire call, one prompt,
 //      two tools: setVariables + endCall).
 //   3. The agent has a thoughtful interview, committing user-verbatim
 //      notes via setVariables. Each setVariables call publishes a
@@ -33,17 +34,17 @@ const EXTRACT_QUALIFICATION_URL = process.env.EXTRACT_QUALIFICATION_URL;
 //       (c) the idle handler hits IDLE_MS with no activity.
 //      All three route through submitIfNotYet(), which is idempotent on
 //      a per-call `submitted` flag.
-//   5. submitIfNotYet POSTs the transcript to the extractQualification
+//   5. submitIfNotYet POSTs the transcript to the extractQualificationTherapist
 //      cloud function. The CF runs an extraction LLM over the transcript
-//      to produce the authoritative QualificationPayload, writes the
-//      qualifications/{prospectKey} doc, and writes a mail/ doc that
-//      triggers the post-call confirmation email.
+//      to produce the authoritative therapist payload, writes the
+//      qualifications/{prospectKey} doc, and (for the therapist flow)
+//      always returns outcome: 'qualified' — no gate.
 //   6. The CF's response carries { outcome, prospectKey, docId }. The
 //      worker publishes a `qualification:outcome` data event so the
 //      frontend swaps to <FinalScreen>. The frontend then disconnects.
-export async function runQualificationFlow(
+export async function runQualificationTherapistFlow(
   ctx: JobContext,
-  meta: QualificationMeta,
+  meta: QualificationTherapistMeta,
 ): Promise<void> {
   await ctx.connect();
 
@@ -251,7 +252,7 @@ export async function runQualificationFlow(
       : 'Sorry, my line glitched for a second — could you say that again?';
   const disposeStallRecovery = attachStallRecovery(session, {
     onRecover: (reason) => {
-      console.warn('[qualification] recovering from stalled generation', { reason });
+      console.warn('[qualification-therapist] recovering from stalled generation', { reason });
       try {
         session.say(RECOVERY_TEXT, { addToChatCtx: false });
       } catch {
@@ -282,13 +283,13 @@ export async function runQualificationFlow(
           avg < POOR_AUDIO_ENTER_THRESHOLD
         ) {
           poorAudioActive = true;
-          console.log('[qualification audio-quality] entering poorAudio', { avg });
+          console.log('[qualification-therapist audio-quality] entering poorAudio', { avg });
           // Don't interrupt here — the user just spoke and the LLM is about
           // to auto-reply. Let the next turn (or the watchdog) handle the
           // mic-check. The poorAudio flag will steer both.
         } else if (poorAudioActive && avg > POOR_AUDIO_EXIT_THRESHOLD) {
           poorAudioActive = false;
-          console.log('[qualification audio-quality] exiting poorAudio', { avg });
+          console.log('[qualification-therapist audio-quality] exiting poorAudio', { avg });
         }
       }
     }
@@ -297,7 +298,7 @@ export async function runQualificationFlow(
   // ─── Submission path ──────────────────────────────────────────────────────
   // The agent reference is captured in a local so submitIfNotYet can read
   // its chatCtx for the transcript. Assigned at session.start below.
-  let agent: QualificationAgent | null = null;
+  let agent: TherapistQualificationAgent | null = null;
   let submitted = false;
 
   // Convert the agent's chat history into a transcript the extraction
@@ -324,12 +325,12 @@ export async function runQualificationFlow(
     submitted = true;
 
     if (!agent) {
-      console.warn('[qualification] submitIfNotYet fired before agent ready', { reason });
+      console.warn('[qualification-therapist] submitIfNotYet fired before agent ready', { reason });
       return;
     }
 
     const transcript = buildTranscript(agent.chatCtx);
-    console.log('[qualification] submitting', {
+    console.log('[qualification-therapist] submitting', {
       reason,
       transcriptTurns: transcript.length,
       userTurnCount,
@@ -347,19 +348,19 @@ export async function runQualificationFlow(
           { reliable: true },
         );
       } catch (err) {
-        console.warn('[qualification] finalizing publishData failed', err);
+        console.warn('[qualification-therapist] finalizing publishData failed', err);
       }
     }
 
-    if (!EXTRACT_QUALIFICATION_URL) {
+    if (!EXTRACT_QUALIFICATION_THERAPIST_URL) {
       console.warn(
-        '[qualification] EXTRACT_QUALIFICATION_URL not set — skipping submission (A4 wires the CF)',
+        '[qualification-therapist] EXTRACT_QUALIFICATION_THERAPIST_URL not set — skipping submission',
       );
       return;
     }
 
     try {
-      const resp = await fetch(EXTRACT_QUALIFICATION_URL, {
+      const resp = await fetch(EXTRACT_QUALIFICATION_THERAPIST_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -370,7 +371,7 @@ export async function runQualificationFlow(
         }),
       });
       if (!resp.ok) {
-        console.error('[qualification] extractQualification returned non-OK', {
+        console.error('[qualification-therapist] extractQualificationTherapist returned non-OK', {
           status: resp.status,
           statusText: resp.statusText,
         });
@@ -396,11 +397,11 @@ export async function runQualificationFlow(
             { reliable: true },
           );
         } catch (err) {
-          console.warn('[qualification] outcome publishData failed', err);
+          console.warn('[qualification-therapist] outcome publishData failed', err);
         }
       }
     } catch (err) {
-      console.error('[qualification] submission failed', err);
+      console.error('[qualification-therapist] submission failed', err);
       // Don't unset `submitted` — the call is already winding down; a retry
       // mid-shutdown would just race the worker exit. The CF is idempotent
       // on prospectKey so a future re-submission (e.g. cron retry) is safe.
@@ -412,15 +413,15 @@ export async function runQualificationFlow(
   // disconnects of the local (agent) participant — only react to remote.
   ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
     if (participant.identity === ctx.room.localParticipant?.identity) return;
-    console.log('[qualification] participant disconnected', { identity: participant.identity });
+    console.log('[qualification-therapist] participant disconnected', { identity: participant.identity });
     submitIfNotYet('disconnect').catch((err) => {
-      console.error('[qualification] disconnect submission error', err);
+      console.error('[qualification-therapist] disconnect submission error', err);
     });
   });
 
   ctx.addShutdownCallback(async () => {
     clearWatchdog();
-    console.log('[qualification flow lifecycle]', {
+    console.log('[qualification-therapist flow lifecycle]', {
       userTurnCount,
       outcome,
       language: meta.language,
@@ -429,10 +430,10 @@ export async function runQualificationFlow(
     });
   });
 
-  agent = new QualificationAgent(meta, ctx, {
+  agent = new TherapistQualificationAgent(meta, ctx, {
     onEndCall: () => {
       submitIfNotYet('endCall').catch((err) => {
-        console.error('[qualification] endCall submission error', err);
+        console.error('[qualification-therapist] endCall submission error', err);
       });
     },
   });
@@ -458,13 +459,13 @@ export async function runQualificationFlow(
   // so the LiveKit room tears down promptly and billing stops.
   const HARD_MAX_SESSION_MS = 25 * 60 * 1000;
   const hardCapTimer = setTimeout(() => {
-    console.warn('[qualification] hard session cap reached, forcing shutdown', {
+    console.warn('[qualification-therapist] hard session cap reached, forcing shutdown', {
       durationMs: HARD_MAX_SESSION_MS,
       userTurnCount,
       submitted,
     });
     submitIfNotYet('hard_cap')
-      .catch((err) => console.error('[qualification] hard_cap submission error', err))
+      .catch((err) => console.error('[qualification-therapist] hard_cap submission error', err))
       .finally(() => {
         // Give the outcome data event a moment to reach the browser so
         // <FinalScreen> swaps before the room tears down. Even on slow

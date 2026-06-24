@@ -1,348 +1,160 @@
-# current-plan.md — Replace loadCallScript's Gemini call with a deterministic parser
+# current-plan.md — Synthesis prompt: rename core tags, multi-slot Ritual, add `<enemy>`, Docs API + tab isolation
+
+> **Overwrites the previous plan** ("Replace loadCallScript's Gemini call with a deterministic parser" — SHIPPED).
+> **Status: IMPLEMENTED (S1+S2+S3+S4). Awaiting deploy.** S4 (Docs API + tab isolation) was added mid-round per the user's request after they saw the example-tab leak risk and the multi-tab structure of the Nashla Doc.
+> **Coordinated change.** This plan ships in lockstep with `samwise-backend/ritual-agent/current-plan.md`. The agent-prompt slice MUST land in the same deploy session — order is enforced in the "Deploy sequence" section below.
+> **Strict minimal-changes mandate from the user.** Nothing in `ritual_synthesis_prompt.txt` or `index.ts` moves except what is explicitly listed below. If a line is not named in this file, it stays byte-for-byte identical.
 
 ## Plan Summary
 
-`loadCallScript` currently sends the flattened Demo Doc text to `gemini-2.5-flash` for parsing into `{ scriptType, phases }`. The prompt itself instructs Gemini to use `[SAY]/[/SAY]` markers DETERMINISTICALLY — i.e. as exact text tokens. That means Gemini is doing no real reasoning anymore; it's a regex job dressed up as an LLM call. The cost is 5–15s of latency per script load (sometimes more), a 120s timeout exposure, and a non-deterministic dependency.
+Three additions to `samwise-backend/cloud-functions/functions/src/ritual_synthesis_prompt.txt` to align the synthesized `userInputs` blob with (a) the new Doc framework's vocabulary, (b) multi-slot daily rituals, and (c) the named adversary the new Doc structurally treats as a proper noun:
 
-This plan rips out the Gemini call and replaces it with a pure TypeScript `parseScript(title, content)` function. Output JSON shape is byte-identical to today's — frontend, localStorage v2 sessions, and the script-pane renderer require no changes.
+- **S1 — Rename four top-level tags.** `<THE STOP>` → `<EXIT FROM THE DAY>`. `<THE CONSCIOUSNESS>` → `<ENTRY INTO THE WORK>`. `<THE INTENTION>` → `<INTENTIONS>`. `<THE COMMITMENT>` → `<THE PACT>`. **Content per tag is unchanged; sub-tags inside each block are unchanged.**
+- **S2 — Extend Rule 7's `<Ritual>` semantics** to require multi-slot rituals to be emitted as plain-prose, time-keyed sub-blocks (one per slot, opened with time + activity name). Single-slot rituals stay free-form, as today.
+- **S3 — Add a new top-level `<enemy>` tag** (sibling to `<user-details>`) that stores the proper-noun name the user gives their adversary. Empty when no Enemy is named in the raw material.
+- **S4 — Switch `registerNewRitual` from plain-text export to Docs API + tab isolation.** Read `Behavioural picture` + `Ritual` + `Ritual Call` tabs as synthesis raw material. Read `Metadata` tab for the five required keys. Fall back to whole-Doc with a BIG warning when any tabs are missing (legacy untabbed Docs continue to work; the warning surfaces the leak risk in cloud-functions logs).
 
-The canonical Demo Doc (`1sBHuGaXCFaP8cmQdUgNpoQYwCq3L4-OfDMDoPR73a5g`) already starts with a literal `[TYPE: demo]` line, so scriptType detection is exact (with a keyword fallback for older Docs that lack the marker).
+S1+S2+S3 flow into the prompt file itself: the rules block (Rule 7), the worked example output. S4 is a small refactor inside `registerNewRitual` in `index.ts` plus one new helper (`extractTabsAsText`) sited next to `flattenDocToText`. No schema changes to the `schedules` / `fallbackSchedules` arrays. No new cloud functions. No new dependencies (googleapis Docs API already in use by `loadCallScript` and `createRitualDoc`).
 
 ## Plan Architecture (Flow)
 
-1. Frontend POSTs `{ googleDocLink }` to `loadcallscript-…cloudfunctions.net`. **Unchanged.**
-2. `loadCallScript` extracts the Doc ID, calls Docs API → returns `doc.data`. **Unchanged.**
-3. `loadCallScript` calls `flattenDocToText(doc.data.body?.content ?? [])` → flat text. **Unchanged.**
-4. `loadCallScript` calls `parseScript(title, content)` → `{ scriptType, phases }`. **NEW** (replaces Gemini round-trip).
-5. Handler returns `res.status(200).json(parsed)`. **Unchanged.**
-
-The Gemini call, the `LOAD_SCRIPT_PROMPT` constant, the `load_call_script_prompt.txt` file, the prompt-fill template-replace, the JSON.parse-of-Gemini-response branch, and the `timeoutSeconds: 120` override all disappear.
+1. The frontend POSTs `{ googleDocLink }` to `registerNewRitual` — **unchanged.**
+2. `registerNewRitual` parses Metadata, fetches Doc title, builds the enriched raw material — **unchanged.**
+3. `registerNewRitual` loads `SYNTHESIS_PROMPT` from `ritual_synthesis_prompt.txt` — **unchanged** (`fs.readFileSync` + build-time `cp` are intact).
+4. Gemini runs the synthesis prompt → returns the JSON envelope `{ userInputs, schedules, fallbackSchedules, behaviorLabel, userID }`. **The shape of this envelope is unchanged.** What changes is the *content* of the `userInputs` string:
+   - It now contains `<EXIT FROM THE DAY>`, `<ENTRY INTO THE WORK>`, `<INTENTIONS>`, `<THE PACT>` (instead of `<THE STOP>` etc.) — **S1.**
+   - Its `<Ritual>` sub-tag, when the Doc has multiple daily slots, is emitted as labeled prose sub-blocks — **S2.**
+   - It now contains a top-level `<enemy>` tag — **S3.**
+5. `RitualData` is built, written to Firestore at `rituals/{id}`. **The Firestore document shape is unchanged** — `userInputs` is still a single opaque string carried inside `agentConfig.userInputs`. The downstream call agent reads it as today; the rename + multi-slot structure are absorbed in the agent's prompt (see the ritual-agent plan).
 
 ## Plan Structure (Directories and files)
 
 ```
-samwise-backend/cloud-functions/functions/
-├── package.json                                # MODIFIED: drop load_call_script_prompt.txt from build cp
-└── src/
-    ├── index.ts                                # MODIFIED: add parseScript(); rewire loadCallScript;
-    │                                           #           remove LOAD_SCRIPT_PROMPT + fs/path reads
-    ├── load_call_script_prompt.txt             # DELETED
-    ├── context-for-code-agent.md               # MODIFIED: add Recent Changes entry
-    └── current-plan.md                         # THIS FILE
+samwise-backend/cloud-functions/functions/src/
+├── ritual_synthesis_prompt.txt    # MODIFIED — S1, S2, S3 (see below)
+├── index.ts                       # MODIFIED — S4 only (Docs API + tab isolation in registerNewRitual + new extractTabsAsText helper)
+├── current-plan.md                # THIS FILE
+└── google-doc-template.md         # NOT MODIFIED (documentation drift acknowledged; out of scope)
+└── extraction_*.txt               # NOT MODIFIED
 ```
 
-External skill update (outside this module):
-- `/Users/samuelgiraldoconcha/Documents/samwise/.claude/skills/samwise-session-copilot/SKILL.md` — update the `loadCallScript` row in the function table and add a note under "Where things live" about the parser.
-
----
+No new files. No deletions. No `package.json` change. No new build step (the existing `cp src/ritual_synthesis_prompt.txt lib/` already carries the modified file into the deployed image; `googleapis` is already an installed dep used by `loadCallScript` and `createRitualDoc`).
 
 ## Modifications (in phases and steps)
 
-### Phase 1 / Step 1 — Add `parseScript` to `index.ts`
+> **What changes inside `ritual_synthesis_prompt.txt` — line by line.**
+>
+> Every modification below is in `ritual_synthesis_prompt.txt`. **No other file in this directory is touched in any phase.**
 
-- **In-file location:** Insert immediately after `flattenDocToText` (currently ends at line 1231) and BEFORE the `loadCallScript` export (line 1244). Drops in at ~line 1232.
-- **Should not be modified:**
-  - `flattenDocToText` itself (lines 1209–1231) — keeps doing what it does today.
-  - `extractDocId` (lines 1197–1201).
-  - The `getGoogleAuth` / `getDriveClient` / `getDocsClient` singletons (lines 480–540 region).
-  - Any other function in the file.
-- **Code:**
+### Phase 1 / Step 1 — S1: rename the four top-level XML tags
 
-```ts
-/* eslint-disable max-len */
-/**
- * parseScript — deterministic Doc-text → {scriptType, phases} parser.
- *
- * Replaces the Gemini-backed parse in loadCallScript. The Doc uses three
- * explicit conventions that make this a pure string job:
- *
- *   - `[TYPE: demo]` / `[TYPE: onboarding]` / `[TYPE: call_design]` —
- *     optional standalone line near the top of the Doc. When present, it's
- *     authoritative. Falls back to title/content keyword matching.
- *
- *   - Phase headings — lines matching `Phase N — title` or `Phase N.M — title`
- *     (em-dash, en-dash, or hyphen accepted). Decimal phases keep their
- *     string form ("1.5", "8.5"); integer phases emit as `number`.
- *
- *   - Pre/Post boundaries — `Pre-call …` / `Precall …` opens a phase with
- *     `number: "pre-call"`. `After the call …` / `Post-call …` opens
- *     `number: "post-call"` (note: the Demo Doc places "After the call" in
- *     the middle of the document — phase order is document order, not
- *     numeric order).
- *
- *   - Body blocks — split deterministically on `[SAY]` / `[/SAY]` text
- *     tokens. Inside markers → "say" block. Outside → "note" block.
- *     `[CONDITION: var=value]` lines stay inside note blocks; the frontend
- *     filters them per-line in script-pane.tsx.
- *
- * Anything before the first phase heading is dropped (preamble — Duration,
- * Goal, Variable syntax, etc.). Trailing non-phase content after the last
- * phase boundary belongs to that last phase's body (the SAY-state machine
- * handles it naturally).
- *
- * @param {string} title Doc title from docs.documents.get → data.title.
- * @param {string} content Flattened Doc text from flattenDocToText.
- * @return {{scriptType: ScriptType, phases: ParsedPhase[]}} Same shape as
- *   the previous Gemini output.
- */
-type ScriptType = "demo" | "onboarding" | "call_design" | "unknown";
-type ParsedBlock = { kind: "say" | "note"; text: string };
-type ParsedPhase = {
-  number: number | string;
-  title: string;
-  blocks: ParsedBlock[];
-};
+- **In-file locations (search-and-replace, four pairs):**
+  - `<THE STOP>` → `<EXIT FROM THE DAY>` (open + close tags).
+  - `<THE CONSCIOUSNESS>` → `<ENTRY INTO THE WORK>` (open + close tags).
+  - `<THE INTENTION>` → `<INTENTIONS>` (open + close tags).
+  - `<THE COMMITMENT>` → `<THE PACT>` (open + close tags).
+  - Apply BOTH in Rule 7's tag-by-tag semantics list AND in the worked example's output AND in the XML template skeleton (if present at the end of the file). Apply replacement on every occurrence, no exceptions.
+- **Should NOT be modified:**
+  - The semantic descriptions inside Rule 7 for each renamed tag stay verbatim — only the tag name changes. E.g. *"THE STOP / Self-affirmation: the kind, compassionate words…"* becomes *"EXIT FROM THE DAY / Self-affirmation: the kind, compassionate words…"* — the word "the kind, compassionate words…" is untouched.
+  - **Sub-tags inside the four blocks DO NOT rename.** `<Self-affirmation>`, `<appreciation-of-little-things>`, `<benefits-hoping-to-gain>`, `<what-do-i-want-to-nurture>`, `<what-do-i-want-to-protect>`, `<immediate>`, `<for-the-day>`, `<for-the-long-run>` — all stay byte-for-byte identical.
+  - The worked example's *content* (Thomas's affirmations, his commitments, his intentions) stays verbatim. Only the wrapping tag names move.
+- **Explanation:** the call agent reads these tags by name. The matching rename in `flows/call/agent.ts` (C1) absorbs the change in lockstep. See "Deploy sequence" for the safety contract.
 
-const TYPE_MARKER_RE = /\[TYPE:\s*(demo|onboarding|call_design)\s*\]/i;
-const PHASE_RE = /^\s*Phase\s+(\d+(?:\.\d+)?)\s*[—–-]\s*(.+?)\s*$/;
-const PRECALL_RE = /^\s*Pre-?call\b.*$/i;
-const POSTCALL_RE = /^\s*(?:After the call|Post-?call)\b.*$/i;
-// Split on both straight and full-width brackets; Google Docs sometimes
-// autocorrects `[` to `［`. Keep both branches.
-const SAY_SPLIT_RE = /(\[\/?SAY\]|［\/?SAY］)/;
+### Phase 1 / Step 2 — S2: extend Rule 7's `<Ritual>` semantics for multi-slot rituals
 
-function detectScriptType(title: string, content: string): ScriptType {
-  // Marker takes priority — exact, authoritative.
-  const head = content.slice(0, 500);
-  const m = head.match(TYPE_MARKER_RE) ?? title.match(TYPE_MARKER_RE);
-  if (m) {
-    const v = m[1].toLowerCase();
-    if (v === "demo" || v === "onboarding" || v === "call_design") return v;
-  }
-  // Keyword fallback for Docs without the marker.
-  const haystack = `${title}\n${head}`.toLowerCase();
-  if (/demo call|compatibility & welcome/.test(haystack)) return "demo";
-  if (/dra\.\s*ana\s*mar[ií]a|onboarding/.test(haystack)) return "onboarding";
-  if (/call\s+design|ritual\s+design/.test(haystack)) return "call_design";
-  return "unknown";
-}
+- **In-file location:** Rule 7's `user-details / Ritual` bullet. Currently reads (verbatim): *"user-details / Ritual: the concrete structure and timing of the practice, including frequency, time of day, and ordered steps. Be specific."*
+- **Modification:** append ONE new paragraph after that sentence, inside the same bullet:
 
-function splitPhaseBody(body: string): ParsedBlock[] {
-  const blocks: ParsedBlock[] = [];
-  let mode: "say" | "note" = "note";
-  let buf: string[] = [];
-  const flush = () => {
-    const text = buf.join("").trim();
-    if (text) blocks.push({kind: mode, text});
-    buf = [];
-  };
-  for (const part of body.split(SAY_SPLIT_RE)) {
-    if (!part) continue;
-    const norm = part
-      .replace("［", "[")
-      .replace("］", "]");
-    if (norm === "[SAY]") {
-      flush();
-      mode = "say";
-    } else if (norm === "[/SAY]") {
-      flush();
-      mode = "note";
-    } else {
-      buf.push(part);
-    }
-  }
-  flush();
-  // Merge consecutive same-kind blocks (defensive — shouldn't happen from
-  // the state machine alone, but a stray empty [SAY][/SAY] pair could).
-  const merged: ParsedBlock[] = [];
-  for (const b of blocks) {
-    const last = merged[merged.length - 1];
-    if (last && last.kind === b.kind) {
-      last.text = `${last.text}\n${b.text}`.trim();
-    } else {
-      merged.push({...b});
-    }
-  }
-  return merged;
-}
+  > If the ritual has more than one daily activity at distinct times, structure the content as **plain-prose sub-blocks, one per slot**, each opened with the slot's time and activity name. The receiving LLM reads `<Ritual>` at call start and picks the sub-block whose time matches the current dispatch slot. Single-slot rituals stay free-form, as today.
 
-interface PhaseHeading {
-  number: number | string;
-  title: string;
-}
+- **Worked example update — in the same step, update the example's `<Ritual>` output** to demonstrate the multi-slot shape. Suggested form (Nashla-shaped; the exact wording is fine to tweak as long as the structure is preserved):
 
-function matchPhaseHeading(line: string): PhaseHeading | null {
-  const m = PHASE_RE.exec(line);
-  if (m) {
-    const numStr = m[1];
-    const number: number | string = numStr.includes(".") ?
-      numStr :
-      parseInt(numStr, 10);
-    return {number, title: m[2].trim()};
-  }
-  if (PRECALL_RE.test(line)) {
-    return {number: "pre-call", title: line.trim()};
-  }
-  if (POSTCALL_RE.test(line)) {
-    return {number: "post-call", title: line.trim()};
-  }
-  return null;
-}
+  ```
+  <Ritual>
+    Morning slot — 8 AM weekdays / 6 AM Tuesdays — Generación de protección:
+    Trigger question: "¿Siento que hoy me va a dar gripa?"
+    If yes: (1) Avisarle a Hanna. (2) Dormir con Hanna. (3) Estar todo el día con Hanna.
+    Accountability: Hanna (hermana), Paul (amigo).
 
-export function parseScript(
-  title: string,
-  content: string,
-): {scriptType: ScriptType; phases: ParsedPhase[]} {
-  const scriptType = detectScriptType(title, content);
+    Afternoon slot — 2 PM daily — Construcción de nueva fe:
+    (1) Listar las cosas que no supe cómo hacer hoy.
+    (2) Anotar un finding por cada cosa.
+  </Ritual>
+  ```
 
-  const lines = content.split(/\r?\n/);
-  type Bucket = PhaseHeading & {bodyLines: string[]};
-  const buckets: Bucket[] = [];
-  let current: Bucket | null = null;
+- **Should NOT be modified:**
+  - The other entries in Rule 7 (Name, Core Motivation, Language, Goal, Context, previous-sessions, the four core blocks' semantics, symbolic-help, social-help) stay verbatim.
+  - Rule 10 (`SCHEDULE EXTRACTION`) stays verbatim — `schedules` and `fallbackSchedules` remain flat string arrays of `DAY_HH:MM`. **No per-slot pairing, no activity tagging.**
+  - The rest of the worked example (Thomas's affirmations, mantras, prayers, UNMAPPED MATERIAL) stays verbatim. Only the `<Ritual>` sub-tag's content shifts to the multi-slot form, AND only because the example needs to teach the new shape.
 
-  for (const line of lines) {
-    const heading = matchPhaseHeading(line);
-    if (heading) {
-      current = {...heading, bodyLines: []};
-      buckets.push(current);
-    } else if (current) {
-      current.bodyLines.push(line);
-    }
-    // Lines before the first heading are dropped (preamble).
-  }
+### Phase 1 / Step 3 — S3: add a new top-level `<enemy>` tag
 
-  const phases: ParsedPhase[] = buckets
-    .map((b) => ({
-      number: b.number,
-      title: b.title,
-      blocks: splitPhaseBody(b.bodyLines.join("\n")),
-    }))
-    .filter((p) => p.blocks.length > 0);
+- **In-file locations (three):**
+  1. **XML template skeleton:** add an empty `<enemy></enemy>` block, sibling to `<user-details>`, BEFORE `<previous-sessions>` in the template's structural order.
+  2. **Rule 7:** add one bullet at the top of the existing tag-by-tag list (above the `user-details` entries) — *"`enemy`: the proper-noun name the user gives their adversary, preserved verbatim per Rule 2. Empty if no Enemy is named in the raw material."*
+  3. **Worked example output:** add ONE line — either `<enemy>la gripa</enemy>` (if the example is updated to demonstrate a named Enemy) OR `<enemy></enemy>` (if Thomas's example stays as-is and we don't want to fabricate an Enemy for him). **Either is acceptable; the call agent's prompt handles the empty case via the elicit fallback chain — see C2.**
+- **Should NOT be modified:**
+  - Rule 2 (detachment metaphor preservation) — verbatim. `<enemy>` is the structured carrier; Rule 2's general metaphor-preservation behavior is what fills it.
+  - Rule 11 (`behaviorLabel`) — verbatim. `<enemy>` and `behaviorLabel` may or may not match; that's fine.
+  - The JSON envelope shape — Rule 9 — verbatim. `<enemy>` lives inside the `userInputs` string, NOT as a top-level field of the JSON envelope.
 
-  return {scriptType, phases};
-}
-/* eslint-enable max-len */
-```
+### Phase 1 / Step 4 — S4: Docs API + tab isolation in `registerNewRitual`
 
+- **In-file locations:** `samwise-backend/cloud-functions/functions/src/index.ts`.
+  - New helper `extractTabsAsText` added immediately after `flattenDocToText` (~line 1232 of the post-implementation file). Walks the Docs API `tabs` array (recursive over `childTabs`); for each tab whose trimmed `tabProperties.title` matches a requested title, returns the flattened body text. Returns `{found: Map<string, string>, missing: string[]}`. First-match wins for duplicate-titled tabs.
+  - The previous `fetch("/export?format=txt")` block inside `registerNewRitual` (was lines 655–668) is replaced by a Docs API call: `docs.documents.get({ documentId, includeTabsContent: true })`. Two named tab sets are extracted:
+    - **Synthesis side:** `["Behavioural picture", "Ritual", "Ritual Call"]` → concatenated as Markdown sections (`# Behavioural picture\n\n…\n\n# Ritual\n\n…\n\n# Ritual Call\n\n…`) into a new `synthesisText` variable.
+    - **Metadata side:** `["Metadata"]` → into the existing `docContent` variable (now scoped to metadata regex parsing only).
+  - If any of the synthesis tabs are missing, log a BIG warning naming the missing tab(s) and the leak risk, then fall back to `flattenDocToText(doc.data.body?.content ?? [])` for `synthesisText`. Same logic for the Metadata tab.
+  - The `enrichedDocContent` construction (was using `${docContent}`) now uses `${synthesisText}` — so the language NOTE injects into the synthesis material, not the metadata text.
+- **Should NOT be modified:**
+  - `getDocsClient` / `getDriveClient` / `getGoogleAuth` lazy-singletons — verbatim.
+  - `flattenDocToText` — verbatim.
+  - The Drive title fetch (still unauthenticated `name` field via Drive API) — verbatim.
+  - The Metadata regex loop — verbatim (still operates on `docContent`).
+  - The Gemini call shape, the `SynthesisResult` interface, the Firestore write — verbatim.
 - **Explanation:**
-  - **`detectScriptType`** — checks the first 500 chars of content for `[TYPE: ...]`, then the title. Falls back to keyword matching (the same heuristic the Gemini prompt used). The Demo Doc already has `[TYPE: demo]` so it takes the deterministic branch.
-  - **`matchPhaseHeading`** — runs all three regexes per line. `PHASE_RE` accepts em-dash (—), en-dash (–), and hyphen (-) as the separator. Decimal numbers stay strings; integers convert to `number`. The Demo Doc uses em-dash throughout — verified against the actual Doc content.
-  - **`splitPhaseBody`** — single-pass state machine. The split-regex captures both straight and full-width SAY markers as separate parts; the loop normalizes them and flips mode. The merge-adjacent pass at the end is defensive (empty `[SAY][/SAY]` pairs).
-  - **The phase loop** — accumulates each phase's body lines in document order. Anything before the first heading is silently dropped (preamble: Duration, Goal, Variable syntax notes — not part of the rendered script).
-  - **`.filter(p => p.blocks.length > 0)`** — empty phases (e.g. a trailing heading with no body) get dropped. The current Gemini parser does the same.
-  - **The Demo Doc's quirks** — Phase 2 is missing (script jumps 1.5 → 3), `After the call` sits between Phase 12 and Phase 13, `Quick variable reference` trails Phase 17. The parser emits everything in document order without sequential validation. The `Quick variable reference` block doesn't match any phase heading and isn't inside a phase body, so it gets dropped naturally (no current phase, content discarded). Subsections like `5a.`, `5b.`, `Step 1 — Anchor on the qualify moment`, `### Reflect` don't match `PHASE_RE` (they don't start with `Phase`) — they stay inside their parent phase's body as part of note blocks.
-
-### Phase 1 / Step 2 — Rewire `loadCallScript`
-
-- **In-file location:** `samwise-backend/cloud-functions/functions/src/index.ts` lines 1244–1293 (the `loadCallScript` export).
-- **Should not be modified:**
-  - The `extractDocId` call, the `getDocsClient` call, the `docs.documents.get` call, `flattenDocToText` invocation, the early 400 guard on missing `googleDocLink`, the surrounding try/catch shape, the 500 fallback. Drive read path stays intact.
-  - The function URL hash — the export name `loadCallScript` is unchanged, so `loadcallscript-b6fhjlgejq-uc.a.run.app` keeps resolving and the frontend's `lib/copilot/load-script.ts` URL constant requires no change.
-- **Code (full replacement of the export body):**
-
-```ts
-/**
- * loadCallScript (HTTP)
- *
- * Body: { googleDocLink: string }
- *
- * Reads the Doc via the Google Docs API, parses it deterministically into
- * { scriptType, phases }. The Doc uses [SAY]/[/SAY] text markers around
- * spoken lines and "Phase N — title" headings — see parseScript() above.
- *
- * Used by samwise-app/app/copilot/ at session start.
- */
-export const loadCallScript = onRequest(
-  {cors: true},
-  async (req, res) => {
-    interface LoadCallScriptBody {
-      googleDocLink: string;
-    }
-
-    try {
-      const {googleDocLink} = req.body as LoadCallScriptBody;
-      if (!googleDocLink) {
-        res.status(400).json({error: "googleDocLink required"});
-        return;
-      }
-
-      const docId = extractDocId(googleDocLink);
-      const docs = getDocsClient();
-      const doc = await docs.documents.get({documentId: docId});
-
-      const title = doc.data.title ?? "";
-      const content = flattenDocToText(doc.data.body?.content ?? []);
-
-      const parsed = parseScript(title, content);
-      res.status(200).json(parsed);
-    } catch (err) {
-      logger.error("loadCallScript failed", err);
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(500).json({error: message});
-    }
-  },
-);
-```
-
-- **Explanation:**
-  - The `timeoutSeconds: 120` override is dropped — Drive read is the only remaining slow path (~1–3s typical). Default Cloud Functions timeout suffices.
-  - The Gemini call, the `LOAD_SCRIPT_PROMPT.replace(...)` lines, the `new GoogleGenerativeAI(...)` instantiation, the `model.generateContent(...)` call, and the JSON.parse-with-502-on-failure branch are all removed.
-  - The 502 error path goes away — there's no longer a layer that can return non-JSON.
-
-### Phase 1 / Step 3 — Remove `LOAD_SCRIPT_PROMPT` constant + its imports
-
-- **In-file location:** lines 462–465 of `index.ts`:
-  ```ts
-  const LOAD_SCRIPT_PROMPT = fs.readFileSync(
-    path.join(__dirname, "load_call_script_prompt.txt"),
-    "utf8",
-  );
-  ```
-- **Should not be modified:** the other prompt file reads (`ritual_synthesis_prompt.txt`, `extraction_qualification_prompt.txt`, `extraction_tracking_prompt.txt`) all stay. The top-of-file `import fs from "fs"` / `import path from "path"` (or however they're spelled in the file) stays — used by the other prompt readers.
-- **Code:** delete the four-line block. Also delete the standalone comment block immediately above it (lines 458–460) that describes the prompt's purpose.
-- **Explanation:** straightforward removal. No reference to `LOAD_SCRIPT_PROMPT` will remain after Step 2.
-
-### Phase 1 / Step 4 — Delete `load_call_script_prompt.txt`
-
-- **File:** `samwise-backend/cloud-functions/functions/src/load_call_script_prompt.txt`.
-- **Action:** delete.
-- **Explanation:** unused after Step 3. Keeping it as a graveyard reference is anti-pattern; the prior content is recoverable from git.
-
-### Phase 1 / Step 5 — Drop the prompt file from the build copy step
-
-- **File:** `samwise-backend/cloud-functions/functions/package.json`.
-- **Change:** in the `build` script, remove `&& cp src/load_call_script_prompt.txt lib/`.
-- **Before:**
-  ```
-  "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/ && cp src/load_call_script_prompt.txt lib/ && cp src/extraction_qualification_prompt.txt lib/ && cp src/extraction_tracking_prompt.txt lib/"
-  ```
-- **After:**
-  ```
-  "build": "tsc && cp src/ritual_synthesis_prompt.txt lib/ && cp src/extraction_qualification_prompt.txt lib/ && cp src/extraction_tracking_prompt.txt lib/"
-  ```
-- **Explanation:** without the source file, `cp` would fail and break every build.
-
----
+  - The deterministic tab isolation eliminates the leak risk where Gemini would otherwise see `Lapse Map`, `Possible origins`, `Ejemplo de ritual`, etc. — these now never reach the model.
+  - The fallback path preserves backwards-compat for any legacy untabbed Doc, but logs loudly so operators see the risk in cloud-functions logs.
+  - Backwards-compat note: any pre-existing tabbed Doc that already names its tabs as `Behavioural picture` / `Ritual` / `Ritual Call` / `Metadata` works without any therapist action. Docs that DON'T match will keep working via the whole-Doc fallback, but the warning will surface.
 
 ## Testing phase
 
 ### Local test (always)
 
-A pure-function offline test against a fixture of the actual Demo Doc text:
+A pure-prompt offline test against a synthetic Doc-text fixture:
 
-1. From `samwise-backend/cloud-functions/functions/`, run `pnpm run build` — must succeed with no TypeScript errors. (`parseScript` has explicit signatures; tsc verifies the return shape.)
-2. Spin a Node REPL or one-off script that requires the built `lib/index.js`, calls `parseScript(title, content)` with a stub of the canonical Doc text (paste a representative excerpt — Phase 1 through Phase 1.5, plus Phase 8.5 and Phase 12, plus "After the call" — into a JS string), and prints the JSON output.
-
-   **Pass criteria:**
-   - `scriptType === "demo"`.
-   - `phases.map(p => p.number)` contains `1`, `"1.5"`, `3`, `4`, `5`, `6`, `7`, `8`, `"8.5"`, `9`, ..., `"post-call"`, `13`, ..., `17` in document order. (Phase 2 is absent — that's correct.)
-   - Phase 1's blocks include a `kind: "say"` block whose text starts with `Hola. Que bueno tenerte aquí.` and DOES NOT contain the literal `[SAY]` or `[/SAY]` strings.
-   - Phase 9's first note block contains `[CONDITION: fit_state=qualified]` as one of its lines (the frontend filter relies on this surviving).
-   - `{{behaviour_to_change}}`, `{{core_motivation}}`, `{{symbolic_anchor_description}}` placeholders are preserved EXACTLY inside say-block text.
-   - Phase 8.5's `number === "8.5"` (string form).
-   - The post-call phase has `number === "post-call"` and contains the "outcome / next_step / rep_notes" content.
-
-3. Quick negative test: pass a content string that does not contain `[TYPE:]` and has no recognizable keywords → expect `scriptType === "unknown"`. Pass an empty content → expect `phases === []`.
+1. From `samwise-backend/cloud-functions/functions/`, run `pnpm run build` — must succeed. The prompt file is text; `tsc` is unaffected, but the build's `cp src/ritual_synthesis_prompt.txt lib/` must continue to land the new file in `lib/`.
+2. Run the existing emulator path (if available) OR call `registerNewRitual` against a staging Firebase project with a known Doc URL. Confirm:
+   - The returned `userInputs` string contains `<EXIT FROM THE DAY>`, `<ENTRY INTO THE WORK>`, `<INTENTIONS>`, `<THE PACT>`, and does NOT contain `<THE STOP>` / `<THE CONSCIOUSNESS>` / `<THE INTENTION>` / `<THE COMMITMENT>`.
+   - If the test Doc declares multiple slots (e.g. morning + afternoon), the `<Ritual>` sub-tag carries them as labeled prose sub-blocks.
+   - A top-level `<enemy>` tag is present (filled OR empty). Tag presence is the contract.
 
 ### Integration test
 
-After deploy:
-- Open `/copilot` in samwise-app, paste the canonical Demo Doc URL, click load.
-- Expect: load completes in ~1–3s instead of 5–15s. The visual output (phases, say cards, note prose, condition-filtered phases when `fit_state` toggles) is identical to what Gemini produced. Test the qualified vs still_disqualified branches by flipping `fit_state` in the variables-table — Phases 9–15 hide/show vs Phases 16–17.
+After cloud-functions deploy (and BEFORE ritual-agent deploy — see Deploy sequence):
+
+- Confirm the deployed `registerNewRitual` URL still returns 200 on a real Doc POST.
+- Skim the `userInputs` field of the resulting `rituals/{id}` Firestore document. Eyeball the four new tag names + the new `<enemy>` tag.
 
 ### Update README
 
-The `samwise-backend/cloud-functions/` README does not currently document `loadCallScript`'s internals (only its existence). The internal switch from Gemini to a parser is documented in (a) the inline JSDoc on `parseScript`, (b) the `samwise-session-copilot` skill, and (c) the Recent Changes entry in `context-for-code-agent.md`. Skip README edit.
+`samwise-backend/cloud-functions/README.md` (if present) and `google-doc-template.md` — **DO NOT update in this phase.** They are documentation drift sources; updating them couples this proposal to a doc rewrite that's out of scope. Will be revisited in a follow-up task.
+
+---
+
+## Deploy sequence (load-bearing)
+
+S1 (this plan) and C1 (the ritual-agent plan) are a coordinated rename. Between deploys, the synthesized userInputs blob and the agent's expected tag names will not match, and every ritual call in that window will fail the agent's tag lookup. Order:
+
+1. **Land** S1+S2+S3 in `cloud-functions`. **Do not deploy yet.**
+2. **Land** C1+C2 in `ritual-agent`. **Do not deploy yet.**
+3. **Verify** both branches compile and pass tests locally.
+4. **Re-register active rituals** (POST each to `registerNewRitual`) to regenerate `userInputs` against S1's new tag names. OR hold the agent deploy until users naturally re-register. The user will decide.
+5. **Deploy `cloud-functions` first**, then `ritual-agent`, in the **same operator session** (no walk-away between).
+6. **Confirm** via the agent's `BUILD_TAG` log line that the new agent build is serving, and via a smoke call that the agent reads the renamed tags correctly.
+
+If the user decides NOT to re-register pre-existing rituals, they MUST schedule the agent deploy for a window where no active rituals will fire — otherwise calls between deploys will fall back to elicit-input mode (the agent's existing safety net for empty tags).
 
 ---
 
@@ -350,18 +162,40 @@ The `samwise-backend/cloud-functions/` README does not currently document `loadC
 
 ### Update `samwise-backend/cloud-functions/functions/src/context-for-code-agent.md`
 
-Append a new entry to the "Recent Changes" section dated 2026-05-26:
-- The Gemini call inside `loadCallScript` was removed in favour of a pure `parseScript()` function. Doc convention (`[TYPE: demo]` marker + `Phase N — title` headings + `[SAY]/[/SAY]` text markers) is deterministic enough that the LLM is doing no real reasoning. Latency drops from 5–15s to ~1–3s (Drive read only). The `load_call_script_prompt.txt` file and its build-time copy are deleted. The function URL is unchanged.
+Append a Recent Changes entry dated the implementation date:
+- `<THE STOP>` / `<THE CONSCIOUSNESS>` / `<THE INTENTION>` / `<THE COMMITMENT>` were renamed to `<EXIT FROM THE DAY>` / `<ENTRY INTO THE WORK>` / `<INTENTIONS>` / `<THE PACT>` in the synthesis prompt, sub-tags unchanged.
+- Rule 7's `<Ritual>` semantics gained a multi-slot prose convention.
+- A new top-level `<enemy>` tag was added to `<user-inputs>` to carry the proper-noun adversary name.
+- Coordinated with `ritual-agent/src/flows/call/agent.ts` (C1 + C2).
 
-Update the `loadCallScript` row in the Module Overview section: drop the "asks Gemini to parse it" / "Model gemini-2.5-flash, timeoutSeconds: 120" wording; replace with "parses it deterministically via `parseScript()` using `[SAY]/[/SAY]` and `Phase N — title` markers."
+### Update `ritual-synthesis-prompt` skill
 
-### Update `samwise-session-copilot` skill
-
-In `/Users/samuelgiraldoconcha/Documents/samwise/.claude/skills/samwise-session-copilot/SKILL.md`:
-- Update the `loadCallScript` row in the three-functions table — drop the "Gemini parse" and "Model gemini-2.5-flash, timeoutSeconds: 120" mentions; replace with "deterministic `parseScript()` in TypeScript — no LLM."
-- Add a short note under "The three cloud functions" stating that the parser swap happened 2026-05-26 and the contract (output JSON shape) is unchanged.
-- The `[SAY]/[/SAY]` marker convention section stays untouched — it's now load-bearing for the parser (was load-bearing for Gemini's deterministic instruction before).
+In `/Users/samuelgiraldoconcha/.claude/skills/ritual-synthesis-prompt/SKILL.md`:
+- The "ten rules at a glance" list does not need to change unless we add an eleventh rule (we are not — the `<enemy>` tag fits under Rule 7's tag-by-tag semantics, and the multi-slot Ritual fits under Rule 7's `<Ritual>` semantics).
+- Add a note under "Adding, removing, or renaming a tag" that this round renamed the four core blocks and added `<enemy>`. The skill's existing three-places-to-change-in-lockstep rule (template, Rule 7, example) governed how this was applied.
+- Note the coordinated change with the ritual-call agent prompt.
 
 ### Mark task DONE
 
-User manually marks the corresponding task in the master Vibe doc Projects tab.
+The user manually marks the corresponding task in the master Vibe doc Projects tab.
+
+---
+
+## Strict out-of-scope list (do NOT touch this round)
+
+If you find yourself editing any of the below in this round, STOP — that change does not belong here:
+
+- **Rule 2** (detachment metaphor preservation) — verbatim.
+- **Rule 9** (JSON envelope shape) — verbatim. No new top-level field.
+- **Rule 10** (schedule extraction) — verbatim. No per-slot activity tags. No fallback pairing.
+- **Rule 11** (`behaviorLabel`) — verbatim.
+- **Sub-tags inside the four renamed blocks** — verbatim.
+- **The `<symbolic-help>` and `<social-help>` blocks** — verbatim. They remain cross-cutting characteristics, not promoted to beats.
+- **`registerNewRitual` in `index.ts`** — S4 modifies the Doc-read block AND splits `docContent` into `docContent` (metadata-only) + `synthesisText` (synthesis-only). The Metadata regex parser is otherwise unchanged. `Name:` is NOT added to the required keys.
+- **`createRitualDoc` in `index.ts`** — not touched. The canonical template Doc and its metadata pre-fill stay as-is.
+- **`extractQualification*` / `extractTrackingKpis` / `loadCallScript`** — not touched.
+- **`checkUsersRituals` cron** — not touched. No new dispatch-metadata fields. No per-slot activity routing in the cron.
+- **`makeCallsBatchFunction`** — not touched.
+- **`google-doc-template.md`** — not touched. Documentation drift will be reconciled in a follow-up task.
+- **`package.json` build script** — not touched. `cp src/ritual_synthesis_prompt.txt lib/` already exists and continues to carry the modified file.
+- **`.firebaserc`, `firebase.json`, indexes, security rules** — not touched.

@@ -1,4 +1,6 @@
-// QualificationAgent — single-agent, one-prompt design.
+// TherapistQualificationAgent — MIRROR of QualificationAgent
+// (flows/qualification/agent.ts). Tools, callbacks, onEnter and structure are
+// identical; only the prompt and the four committed variables differ.
 //
 // Tools the model uses:
 //   - setVariables(...)  Live notes. Each committed variable publishes a
@@ -15,18 +17,16 @@
 //
 // Agent ↔ scribe split (see programming-style.md / "converse → extract"):
 //   - Agent's job: talk to the user, take accurate live notes.
-//   - Extraction LLM's job (in `extractQualification` cloud function,
-//     triggered by the worker on endCall or disconnect): read the full
-//     transcript and emit the authoritative QualificationPayload —
-//     including the inference fields the agent never touches
-//     (decision_taken, behaviour_clarity, motivation_clarity).
+//   - Extraction LLM's job (in `extractQualificationTherapist` cloud
+//     function, triggered by the worker on endCall or disconnect): read the
+//     full transcript and emit the authoritative therapist payload.
 import { type JobContext, llm, voice } from '@livekit/agents';
 import { z } from 'zod';
-import { type QualificationMeta } from '../../types/metadata';
-import { buildQualificationPrompt } from './prompts/qualification-prompt';
+import { type QualificationTherapistMeta } from '../../types/metadata';
+import { buildTherapistQualificationPrompt } from './prompts/qualification-therapist-prompt';
 
 // The user-facing variables the agent commits via setVariables.
-// These mirror the <variables> block in qualification-prompt.ts.
+// These mirror the <variables> block in qualification-therapist-prompt.ts.
 // Each variable is optional in any single call — the agent commits only
 // the ones it has a verbatim user quote for in this turn. Fields are
 // `.nullish()` (not `.optional()`): the OpenAI fallback emits `null` for
@@ -34,38 +34,35 @@ import { buildQualificationPrompt } from './prompts/qualification-prompt';
 // failing the whole setVariables call ("invalid arguments") so NO note is
 // written. `.nullish()` accepts the null; the execute handler skips it.
 const SetVariablesArgsSchema = z.object({
-  behaviour_to_change: z
+  patient_addiction_type: z
     .string()
     .nullish()
     .describe(
-      "The specific verb-and-object action the user confirmed wanting to change. Must be a sentence (e.g. 'Pull out my phone and scroll Twitter when I sit down to prospect'), not a label. Only commit when the action is grounded in a concrete recent incident AND the user has confirmed it.",
+      "The addiction(s) the user's patients usually present with, in their own words. Only commit when the user has answered the first question and you have a verbatim quote.",
     ),
-  core_motivation: z
+  last_patient_occurrence: z
     .string()
     .nullish()
     .describe(
-      "In the user's own words, what changing this unlocks for them — their answer to 'what would changing this unlock / why does it matter'. Commit ONLY from that explicit answer; NEVER from a confirmation like 'yes that's accurate', from the behaviour statement, or by inference. If the user hasn't stated their why yet, leave this empty and ask for it instead — a wrong value here makes the agent skip the question.",
+      "When the user last had a patient with this problem, in their own words ('last week', 'I'm seeing one right now', 'a few months ago').",
     ),
-  problem_duration_self_reported: z
+  helped_patient_attempts: z
     .string()
     .nullish()
     .describe(
-      "How long it's been a struggle, in the user's words ('two years', 'since the divorce').",
+      "What the user has tried to help that patient, in their own words. Verbatim — do not summarize.",
     ),
-  life_stage_context: z
+  why_attempts_failed: z
     .string()
     .nullish()
     .describe(
-      "Where the user is in life right now — work, family, what's loud.",
+      "Why, in the user's view, that has failed to work, in their own words. Verbatim — do not summarize.",
     ),
-  // symbolic_anchor_description, alternatives_tried, why_alternatives_failed
-  // moved to the Demo Call (captured live in its Phase 1.5). The Fit
-  // Assessment no longer elicits or commits them.
 });
 
 const EndCallArgsSchema = z.object({});
 
-export type QualificationAgentCallbacks = {
+export type QualificationTherapistAgentCallbacks = {
   /**
    * Called when the model invokes `endCall`. The worker uses this to
    * trigger the end-of-call extraction + submission. Idempotent — the
@@ -75,18 +72,18 @@ export type QualificationAgentCallbacks = {
   onEndCall: () => void;
 };
 
-export class QualificationAgent extends voice.Agent {
+export class TherapistQualificationAgent extends voice.Agent {
   constructor(
-    meta: QualificationMeta,
+    meta: QualificationTherapistMeta,
     ctx: JobContext,
-    callbacks: QualificationAgentCallbacks,
+    callbacks: QualificationTherapistAgentCallbacks,
   ) {
     const room = ctx.room;
     const { onEndCall } = callbacks;
     let endCalled = false;
 
     super({
-      instructions: buildQualificationPrompt(
+      instructions: buildTherapistQualificationPrompt(
         meta.language,
         meta.prospect_name,
         'voice',
@@ -115,8 +112,7 @@ export class QualificationAgent extends voice.Agent {
                 );
                 committed.push(name);
               } catch {
-                // Race with shutdown — ignore. The extraction LLM at end of
-                // call will still pick up the value from the transcript.
+                // Race with shutdown — ignore. The extraction LLM still reads the transcript.
               }
             }
             return { committed };
@@ -133,8 +129,7 @@ export class QualificationAgent extends voice.Agent {
             try {
               onEndCall();
             } catch {
-              // Worker callback failed — log via runtime, but still report
-              // ok to the model so it doesn't loop trying to retry endCall.
+              // Worker callback failed — still report ok so the model doesn't loop.
             }
             return { ok: true };
           },

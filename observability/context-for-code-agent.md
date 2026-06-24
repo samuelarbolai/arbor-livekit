@@ -115,14 +115,17 @@ introduce a new LLM client or framework.
 
 ### Recent Changes
 
-- **2026-05-31 — Phase 1 base tracing shipped; per-call tagging OPEN.** `ritual-agent` exports base spans
-  to Langfuse (`src/config/tracing.ts`, `initTracing()` in `main.ts` prewarm, `applyConversationTracing()`
-  in the qualification flow). **Caveat:** the per-call tagging path is a silent no-op — `@livekit/agents`'s
-  `setTracerProvider(p, {metadata})` calls OTel **v1** `addSpanProcessor`, which the **v2** provider
-  (`@langfuse/otel` requires v2) removed → it threw and crashed every flow on entry; another session made
-  all tracing non-fatal (try/catch). So today traces reach Langfuse **ungrouped + untagged**. Fix (custom
-  v2 `SpanProcessor` or active root span) is deferred and must be **verified live before being written into
-  any skill**. The `samwise-livekit-agents` skill's "Langfuse tracing" section captures the verified crash
-  lesson; the tagging mechanism is intentionally left OPEN there.
-- For all Langfuse docs/API/CLI work use the generic `langfuse` skill (and its rule: never implement from
-  memory — verify against current docs). Phase 2's judge should follow its `judge-calibration.md`.
+- **2026-06-04 — REVERTED to a clean slate; re-planned from scratch.** The 2026-05-31 attempt
+  (`tracing.ts`/`observability.ts` + wiring + deps) was reverted — only this HQ folder + the `.env.local`
+  keys survive. Fresh plan in `current-plan.md`. Two things changed vs. the reverted attempt:
+  1. **Tagging mechanism FIXED.** Do NOT use `setTracerProvider(p, {metadata})` — it calls OTel **v1**
+     `addSpanProcessor`, removed in the **v2** provider `@langfuse/otel` forces → it crashed every flow on
+     entry. Correct v2 mechanism (doc-verified via the `langfuse` skill): a **custom `SpanProcessor` that
+     stamps the `langfuse.*` attrs on every span in `onStart`** (reading a per-job ref), added at provider
+     construction; OTel **Baggage** is the concurrency-safe upgrade if concurrent jobs on one worker
+     cross-contaminate. Register the provider with `telemetry.setTracerProvider(provider)` — no metadata.
+     Always wrap tracing non-fatal.
+  2. **Scope is now 5 flows** (`main.ts` routes `call`/`onboarding`/`qualification`/`demo-call`/`scribe`),
+     not 3 — observability covers all conversational flows.
+- For all Langfuse docs/API/CLI work use the `langfuse` skill (rule: never implement from memory — verify
+  against current docs). Phase 2's judge follows its `judge-calibration.md`; triage follows `error-analysis.md`.

@@ -45,7 +45,47 @@ export interface QualificationMeta {
   prospect_email: string;
 }
 
-export type DispatchMeta = CallMeta | OnboardingMeta | QualificationMeta;
+// QualificationTherapistMeta — web first-touch Fit Assessment for THERAPISTS.
+// A mirror of QualificationMeta (same fields) dispatched by samwise-landing's
+// qualify voice-init when the picker's audience selection is "therapist". The
+// only thing that distinguishes it is the flow value, which routes to the
+// therapist flow (different opener + 4 questions + always-books close).
+export interface QualificationTherapistMeta {
+  flow: 'qualification-therapist';
+  language: Language;
+  prospect_name: string;
+  prospect_email: string;
+}
+
+// DemoCallMeta — web autonomous Demo Call (~50 min). Dispatched by the
+// demo-call entry path (walk-in/init for an autonomous booking). prospect_email
+// hydrates the qualification prefill server-side at call start; script_doc_url
+// lets the Doc be overridden (defaults to the canonical Demo Doc in script.ts).
+export interface DemoCallMeta {
+  flow: 'demo-call';
+  language: Language;
+  prospect_name: string;
+  prospect_email: string;
+  script_doc_url: string;
+}
+
+// ScribeMeta — silent transcription agent for HUMAN↔human /meet calls (walk-in
+// or scheduled). Dispatched by samwise-app's walk-in/init when a call has NO AI
+// guide (autonomous calls already transcribe via the demo-call agent). The
+// scribe needs nothing but the language for Deepgram; it discovers the human
+// participants from the room and publishes per-speaker transcriptions.
+export interface ScribeMeta {
+  flow: 'scribe';
+  language: Language;
+}
+
+export type DispatchMeta =
+  | CallMeta
+  | OnboardingMeta
+  | QualificationMeta
+  | QualificationTherapistMeta
+  | DemoCallMeta
+  | ScribeMeta;
 
 // Backwards compatibility: existing makeCallsBatchFunction dispatches don't
 // include `flow`. Default missing/unrecognized flow to 'call' so the production
@@ -76,6 +116,29 @@ export function parseDispatchMetadata(raw: string | undefined | null): DispatchM
       prospect_name: String(m.prospect_name ?? '').trim() || 'friend',
       prospect_email: String(m.prospect_email ?? '').trim(),
     };
+  }
+
+  if (flow === 'qualification-therapist') {
+    return {
+      flow: 'qualification-therapist',
+      language,
+      prospect_name: String(m.prospect_name ?? '').trim() || 'friend',
+      prospect_email: String(m.prospect_email ?? '').trim(),
+    };
+  }
+
+  if (flow === 'demo-call') {
+    return {
+      flow: 'demo-call',
+      language,
+      prospect_name: String(m.prospect_name ?? '').trim() || 'friend',
+      prospect_email: String(m.prospect_email ?? '').trim(),
+      script_doc_url: String(m.script_doc_url ?? ''),
+    };
+  }
+
+  if (flow === 'scribe') {
+    return { flow: 'scribe', language };
   }
 
   return {

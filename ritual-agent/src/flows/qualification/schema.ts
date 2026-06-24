@@ -11,17 +11,17 @@ import { z } from 'zod';
 // the worker side) has a single zod source.
 
 // ─── SetVariablesArgsSchema ────────────────────────────────────────────────
-// Input schema for the agent's `setVariables` tool. The seven user-facing
+// Input schema for the agent's `setVariables` tool. The user-facing
 // variables the agent commits as live notes during the conversation.
 // All fields optional in any single call.
+// NOTE: symbolic_anchor_description, alternatives_tried, why_alternatives_failed
+// moved OUT of the Fit Assessment and INTO the Demo Call (captured live in the
+// demo's Phase 1.5). The qualifying experience no longer touches them.
 export const SetVariablesArgsSchema = z.object({
   behaviour_to_change: z.string().optional(),
   core_motivation: z.string().optional(),
   problem_duration_self_reported: z.string().optional(),
   life_stage_context: z.string().optional(),
-  symbolic_anchor_description: z.string().optional(),
-  alternatives_tried: z.string().optional(),
-  why_alternatives_failed: z.string().optional(),
 });
 
 export type SetVariablesArgs = z.infer<typeof SetVariablesArgsSchema>;
@@ -51,13 +51,9 @@ export const QualificationPayloadSchema = z.object({
   core_motivation: z.string().optional(),
   problem_duration_self_reported: z.string().optional(),
   life_stage_context: z.string().optional(),
-  symbolic_anchor_type: z
-    .enum(['religious', 'philosophical', 'esoteric', 'hyper-rational', 'none', 'unknown'])
-    .optional(),
-  symbolic_anchor_description: z.string().optional(),
-  alternatives_tried: z.string().optional(),
-  why_alternatives_failed: z.string().optional(),
-  alternatives_exhaustion_level: z.enum(['low', 'medium', 'high', 'unknown']).optional(),
+  // symbolic_anchor_*, alternatives_tried, why_alternatives_failed and
+  // alternatives_exhaustion_level moved to the Demo Call (captured live in
+  // Phase 1.5) — no longer extracted by the Fit Assessment.
 });
 
 export type QualificationPayload = z.infer<typeof QualificationPayloadSchema>;
